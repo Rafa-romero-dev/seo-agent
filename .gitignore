@@ -1,0 +1,8 @@
+# Ignore everything
+*
+!.gitignore
+!agent.py
+!serp_config.py
+!README.md
+# Allow traversing into directories so the exceptions can take effect
+!*/
