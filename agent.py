@@ -289,25 +289,22 @@ def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -
 
 def serpapi_gbp_extractor(keyword, city, api_key, max_api_retries=3) -> dict:
     """
-    Fetches GBP data (Rating, Reviews) from the Local Pack using SerpApi.
-    Returns a dictionary of extracted GBP data or default values.
+    Fetches the top *competitive* GBP data for a keyword/city query 
+    using the dedicated google_local engine.
     """
+    gbp_data = {
+        'GBP_Place_ID': '',  
+        'GBP_Rating': 0.0,
+        'GBP_Review_Count': 0
+    }
     
-    # Use only 1 page (start=0) for Local Pack, as results are contained on page 1.
     params = {
         "api_key": api_key,
-        "engine": "google",
+        "engine": "google_local", 
         "q": f"{keyword} {city}",
         "location": city,
         "hl": "en",
         "start": 0,
-        "num": 10  # num is irrelevant for local pack, but required
-    }
-    
-    gbp_data = {
-        'GBP_Place_ID': '',
-        'GBP_Rating': 0.0,
-        'GBP_Review_Count': 0
     }
     
     for attempt in range(max_api_retries):
@@ -316,41 +313,48 @@ def serpapi_gbp_extractor(keyword, city, api_key, max_api_retries=3) -> dict:
             results = search.get_dict()
             
             if 'error' in results:
-                print(f"-> GBP API Error (Attempt {attempt + 1}): {results['error']}")
-                if attempt < max_api_retries - 1:
-                    time.sleep(2 ** attempt + random.uniform(0, 1))
+                error_msg = results['error']
+                if any(err in error_msg.lower() for err in ["rate limit", "internal server error"]):
+                    print(f"-> SERP API Transient Error: {error_msg}. Retrying in {2**attempt}s...")
+                    time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
                     continue
-                return gbp_data
+                else:
+                    print(f"-> SERP API Fatal Error: {error_msg}. Giving up on this query.")
+                    return gbp_data
 
-            local_results = results.get("local_results", [])
+            local_results = results.get("local_results")
             
-            if local_results:
-                # Iterate through local results to find the most relevant one, 
-                # or just use the first few as proxies for the local competitive landscape
-                for result in local_results:
-                    # We will only process the first result as a baseline for the target query
-                    gbp_data['GBP_Place_ID'] = result.get('place_id', '')
-                    gbp_data['GBP_Rating'] = result.get('rating', 0.0)
-                    # Convert review count string " (100)" to integer
-                    reviews_str = result.get('reviews', ' (0)').replace('(', '').replace(')', '').strip()
-                    try:
-                        gbp_data['GBP_Review_Count'] = int(reviews_str)
-                    except ValueError:
-                        gbp_data['GBP_Review_Count'] = 0
+            if local_results and len(local_results) > 0:
+                top_result = local_results[0]
+                gbp_data['GBP_Place_ID'] = top_result.get('place_id', '')
+                gbp_data['GBP_Rating'] = top_result.get('rating', 0.0)
+                
+                reviews_raw = top_result.get('reviews')
+                
+                if reviews_raw:
+                    reviews_str = str(reviews_raw).replace('(', '').replace(')', '').strip()
+                else:
+                    reviews_str = "0"
                     
-                    # For this step, we just grab the first one found to indicate the query's GBP environment
-                    break 
+                try:
+                    gbp_data['GBP_Review_Count'] = int(reviews_str)
+                except ValueError:
+                    gbp_data['GBP_Review_Count'] = 0 
+                
+                print(f"-> GBP data retrieved (Attempt {attempt+1}): Rating {gbp_data['GBP_Rating']}, Reviews {gbp_data['GBP_Review_Count']}")
+                return gbp_data 
 
-            time.sleep(random.uniform(1, 2))
-            return gbp_data
+            else:
+                print(f"-> Local API query successful, but no businesses found for: '{keyword} {city}'.")
+                return gbp_data 
             
         except Exception as e:
-            print(f"-> Critical GBP Request Error: {e.__class__.__name__}. Retrying...")
-            if attempt < max_api_retries - 1:
-                time.sleep(2 ** attempt + random.uniform(0, 1))
-                continue
-            return gbp_data
-    
+            error_name = e.__class__.__name__
+            print(f"-> General SerpApi Error: {error_name}. Retrying in {2**attempt}s...")
+            time.sleep(2 ** attempt + random.uniform(0.5, 1.5))
+            continue
+            
+    print(f"-> GBP data collection failed after {max_api_retries} retries.")
     return gbp_data
 
 def _get_rating_score(rating, reviews) -> str:
@@ -366,93 +370,97 @@ def _get_rating_score(rating, reviews) -> str:
     
 def generate_sales_pitch(row):
     """
-    Generates a personalized, concise sales pitch based on audit failures AND GBP performance.
+    Generates a personalized, concise sales pitch based on audit failures
+    AND the *Competitive* GBP performance for the target query.
     """
     pitch_points = []
-    intro_statement = (
-        "Based on an **AI-powered analysis** of your site and local market, we found the following actionable gap(s): "
-    )
     
-    # --- AUDIT ANALYSIS ---
+    # --- AUDIT DATA ---
     h1_status = row['H1_Audit_Result']
     nap_status = row['NAP_Audit_Result']
     robots_status = row.get('Robots_Status', 'Pass: Index/Follow')
-
-    # --- GBP ANALYSIS ---
+    error_status = row.get('Error_Status')
+    
+    # --- COMPETITIVE GBP ANALYSIS ---
+    # These represent the top-ranked Local Map Pack business for the query
     gbp_rating = row.get('GBP_Rating', 0.0)
     gbp_reviews = row.get('GBP_Review_Count', 0)
     gbp_score = _get_rating_score(gbp_rating, gbp_reviews)
     
-    # --- 1. CRITICAL FAILURES (Non-Negotiable Fixes) ---
-    if row.get('Error_Status') != 'Success':
-          pitch_points.append(
-            f"Your website returned an error ({row.get('Error_Status').split('(')[0].strip()}) when we tried to audit it. This suggests a potential **server or site health issue** that needs immediate attention."
-        )
-    if "Request Failed" in row.get('Error_Status') or "Parsing Failure" in row.get('Error_Status'):
-        return intro_statement + " | ".join(pitch_points)
+    # --- Intro Statement based on audit quality ---
+    intro_statement = "Based on an **AI-powered analysis** of your site and local market, we found the following actionable gap(s): "
 
+    # --- 1. CRITICAL FAILURES (Non-Negotiable Fixes) ---
+    
+    # Handle connection/parsing failures immediately (Stops further checks)
+    if error_status != 'Success' and error_status is not None:
+        return (
+            f"Your website returned an error ({error_status.split('(')[0].strip()}) when we tried to audit it. This suggests a potential **server or site health issue** that needs immediate attention."
+        )
+
+    # Handle NOINDEX immediately (Most critical SEO failure)
     if robots_status.startswith("Fail: NOINDEX"):
         pitch_points.append(
             "Critical Issue: Your homepage has a **'NOINDEX' tag**, meaning Google is blocked from showing you in search results! This is the most urgent fix."
         )
+        return intro_statement + " | ".join(pitch_points)
+        
+    # --- 2. MAIN SEO GAPS (Keyword & Local Authority) ---
     
-    # --- 2. GBP-ENHANCED PITCHES (Leveraging Social Proof) ---
-    seo_failure_count = sum([
-        1 if h1_status.startswith("Fail") else 0,
-        1 if nap_status.startswith("Fail") else 0
-    ])
-
-    if seo_failure_count >= 1:
-        if gbp_score == "Strong":
-            # Target 1: Winning on Reputation, Losing on Website (Huge Upside)
-            pitch_points.append(
-                f"You have a **strong GBP reputation ({gbp_rating} stars from {gbp_reviews} reviews)**, which is fantastic. However, your website's fundamentals (H1/NAP) are holding back those customers from converting once they click through. We can double your lead volume."
-            )
-        elif gbp_score in ["Weak", "Missing"]:
-            # Target 2: Losing on Both Fronts (Major Opportunity)
-            pitch_points.append(
-                f"Your website has fundamental SEO gaps (H1/NAP), and your **GBP profile is weak** ({gbp_rating} stars from {gbp_reviews} reviews). By fixing your website AND implementing a review generation system, you could dominate the Map Pack."
-            )
-
-    # If no major SEO pitch was made (i.e., SEO is good but GBP is weak)
-    if not pitch_points and gbp_score in ["Weak", "Missing"]:
+    # Check H1 relevance
+    if "Irrelevant" in h1_status:
         pitch_points.append(
-            f"Your website is well-optimized, but your **GBP profile is weak** ({gbp_rating} stars from {gbp_reviews} reviews). We can focus on generating reviews to secure the Map Pack and maximize the power of your current rankings."
+            "Your main headline (**H1**) doesn't mention your core service or city. Google relies on this to rank you. Fixing this is the **fastest way to improve visibility**."
+        )
+    elif "Missing" in h1_status:
+        pitch_points.append(
+            "Missing a crucial **H1 heading** on your homepage! Search engines rely on this to know what you do. This is the **fastest way to improve your visibility**."
         )
 
-    # --- 3. STANDARD SEO GAPS (Only if not already covered by GBP pitch) ---
-    if not any("H1" in p for p in pitch_points):
-        if "Irrelevant" in h1_status:
-             pitch_points.append(
-                "Your main headline (H1) doesn't mention your core service or city. Google relies on this to rank you. Fixing this is the **fastest way to improve visibility**."
-            )
-        elif "Missing" in h1_status:
-            pitch_points.append(
-                "Missing a crucial H1 heading on your homepage! Search engines rely on this to know what you do. This is the **fastest way to improve your visibility**."
-            )
-    
-    if not any("NAP" in p for p in pitch_points) and nap_status.startswith("Fail"):
+    # Check NAP
+    if nap_status.startswith("Fail"):
         pitch_points.append(
             "Can't find your phone number or address quickly. This hurts user trust and is a **critical fix for local SEO rankings** (the 'Map Pack')."
         )
         
-    # --- 4. SECONDARY GAPS ---
-    if row['Title_Status'].startswith("Fail"):
-        pitch_points.append(f"Your title tag is {row['Title_Status'].split(':')[1].strip().lower()}. This is your first impression to Google and potential customers.")
+    # --- 3. GBP-ENHANCED PITCHES (Using Competitor Context) ---
     
-    if row['Meta_Desc_Status'].startswith("Fail: Missing"):
-        pitch_points.append("You are missing a crucial Meta Description, leaving Google to write its own (often poor) one for your search results.")
-
-    schema_status = row['Schema_Issue']
-    if schema_status.startswith("Fail"):
+    seo_gaps_exist = any("H1" in p or "NAP" in p for p in pitch_points)
+    
+    if seo_gaps_exist and gbp_score == "Strong":
+        # Strategy: Your competitor is winning on reputation, you must win on website.
         pitch_points.append(
-            "You are missing Structured Data (Schema Markup). Adding 'LocalBusiness' schema is essential for Google to understand your services and is a huge factor for Map visibility."
+            f"Your top competitor has a **strong GBP reputation ({gbp_rating} stars from {gbp_reviews} reviews)**. Your site's fundamental gaps (H1/NAP) are holding you back from competing with them and converting the customers who find you. We can fix your site today."
         )
+    elif gbp_score == "Missing":
+        # Strategy: The local map pack is weak/missing. Huge, open opportunity.
+        pitch_points.append(
+            "The **local Map Pack is under-optimized** for your query (no strong competitor is showing). By fixing your website AND quickly establishing a strong review profile, you could easily dominate the Map Pack."
+        )
+    
+    # --- 4. SECONDARY GAPS (If primary pitch points are empty) ---
+    
+    if not pitch_points: # Only append if no major gaps or GBP context were added above
+        if row['Title_Status'].startswith("Fail"):
+            pitch_points.append(f"Your title tag is {row['Title_Status'].split(':')[1].strip().lower()}. This is your first impression to Google and potential customers.")
+        
+        if row['Meta_Desc_Status'].startswith("Fail: Missing"):
+            pitch_points.append("You are missing a crucial Meta Description, leaving Google to write its own (often poor) one for your search results.")
 
+        schema_status = row['Schema_Issue']
+        if schema_status.startswith("Fail"):
+            pitch_points.append(
+                "You are missing Structured Data (Schema Markup). Adding 'LocalBusiness' schema is essential for Google to understand your services and is a huge factor for Map visibility."
+            )
+            
+    # --- FINAL RETURN ---
     if pitch_points:
-        return intro_statement + " | ".join(pitch_points)
+        # Deduplicate the pitch points if any were double-added (e.g., NAP in section 2 & 3)
+        # Using a set to ensure unique messages
+        unique_pitches = list(dict.fromkeys(pitch_points)) 
+        return intro_statement + " | ".join(unique_pitches)
     else:
-        return intro_statement + "None! Your site is strong. We specialize in advanced strategies (authority building, conversion rate optimization) to take you from #10 to #1."
+        return intro_statement + "None! Your site is strong. We specialize in advanced strategies (authority building, conversion rate optimization) to take you from rank #10 to rank #1."
     
 def create_final_report(df):
     """

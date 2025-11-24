@@ -1,7 +1,7 @@
 # --- CITIES: smaller MSA cities for better targeting ---
 CITIES = [
-    "Lamesa, TX",
-    "Vernon, TX",
+    "Midland, Texas, United States",
+    "Wichita Falls, Texas, United States",
 ]
 
 # --- KEYWORDS: Core Diesel Repair Services ---
