@@ -287,55 +287,162 @@ def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -
     
     return audit_data
 
+def serpapi_gbp_extractor(keyword, city, api_key, max_api_retries=3) -> dict:
+    """
+    Fetches GBP data (Rating, Reviews) from the Local Pack using SerpApi.
+    Returns a dictionary of extracted GBP data or default values.
+    """
+    
+    # Use only 1 page (start=0) for Local Pack, as results are contained on page 1.
+    params = {
+        "api_key": api_key,
+        "engine": "google",
+        "q": f"{keyword} {city}",
+        "location": city,
+        "hl": "en",
+        "start": 0,
+        "num": 10  # num is irrelevant for local pack, but required
+    }
+    
+    gbp_data = {
+        'GBP_Place_ID': '',
+        'GBP_Rating': 0.0,
+        'GBP_Review_Count': 0
+    }
+    
+    for attempt in range(max_api_retries):
+        try:
+            search = GoogleSearch(params)
+            results = search.get_dict()
+            
+            if 'error' in results:
+                print(f"-> GBP API Error (Attempt {attempt + 1}): {results['error']}")
+                if attempt < max_api_retries - 1:
+                    time.sleep(2 ** attempt + random.uniform(0, 1))
+                    continue
+                return gbp_data
+
+            local_results = results.get("local_results", [])
+            
+            if local_results:
+                # Iterate through local results to find the most relevant one, 
+                # or just use the first few as proxies for the local competitive landscape
+                for result in local_results:
+                    # We will only process the first result as a baseline for the target query
+                    gbp_data['GBP_Place_ID'] = result.get('place_id', '')
+                    gbp_data['GBP_Rating'] = result.get('rating', 0.0)
+                    # Convert review count string " (100)" to integer
+                    reviews_str = result.get('reviews', ' (0)').replace('(', '').replace(')', '').strip()
+                    try:
+                        gbp_data['GBP_Review_Count'] = int(reviews_str)
+                    except ValueError:
+                        gbp_data['GBP_Review_Count'] = 0
+                    
+                    # For this step, we just grab the first one found to indicate the query's GBP environment
+                    break 
+
+            time.sleep(random.uniform(1, 2))
+            return gbp_data
+            
+        except Exception as e:
+            print(f"-> Critical GBP Request Error: {e.__class__.__name__}. Retrying...")
+            if attempt < max_api_retries - 1:
+                time.sleep(2 ** attempt + random.uniform(0, 1))
+                continue
+            return gbp_data
+    
+    return gbp_data
+
+def _get_rating_score(rating, reviews) -> str:
+    """Classifies the GBP status for pitch generation."""
+    if rating >= 4.5 and reviews >= 50:
+        return "Strong" # Winning on reputation
+    elif rating >= 4.0 and reviews >= 10:
+        return "Decent" # Room for improvement
+    elif rating > 0 and reviews > 0:
+        return "Weak" # Low volume or poor score
+    else:
+        return "Missing" # No rating/reviews found
+    
 def generate_sales_pitch(row):
     """
-    Generates a personalized, concise sales pitch based on audit failures.
+    Generates a personalized, concise sales pitch based on audit failures AND GBP performance.
     """
     pitch_points = []
+    intro_statement = (
+        "Based on an **AI-powered analysis** of your site and local market, we found the following actionable gap(s): "
+    )
     
-    # Check 1: Technical Error
+    # --- AUDIT ANALYSIS ---
+    h1_status = row['H1_Audit_Result']
+    nap_status = row['NAP_Audit_Result']
+    robots_status = row.get('Robots_Status', 'Pass: Index/Follow')
+
+    # --- GBP ANALYSIS ---
+    gbp_rating = row.get('GBP_Rating', 0.0)
+    gbp_reviews = row.get('GBP_Review_Count', 0)
+    gbp_score = _get_rating_score(gbp_rating, gbp_reviews)
+    
+    # --- 1. CRITICAL FAILURES (Non-Negotiable Fixes) ---
     if row.get('Error_Status') != 'Success':
           pitch_points.append(
             f"Your website returned an error ({row.get('Error_Status').split('(')[0].strip()}) when we tried to audit it. This suggests a potential **server or site health issue** that needs immediate attention."
         )
-
     if "Request Failed" in row.get('Error_Status') or "Parsing Failure" in row.get('Error_Status'):
-        return " | ".join(pitch_points)
-    
-    # Check 2: Meta Robots Failure
-    robots_status = row['Robots_Status']
+        return intro_statement + " | ".join(pitch_points)
+
     if robots_status.startswith("Fail: NOINDEX"):
         pitch_points.append(
             "Critical Issue: Your homepage has a **'NOINDEX' tag**, meaning Google is blocked from showing you in search results! This is the most urgent fix."
         )
+    
+    # --- 2. GBP-ENHANCED PITCHES (Leveraging Social Proof) ---
+    seo_failure_count = sum([
+        1 if h1_status.startswith("Fail") else 0,
+        1 if nap_status.startswith("Fail") else 0
+    ])
 
-    # Check 3: H1 Failure
-    h1_status = row['H1_Audit_Result']
-    if h1_status.startswith("Fail"):
+    if seo_failure_count >= 1:
+        if gbp_score == "Strong":
+            # Target 1: Winning on Reputation, Losing on Website (Huge Upside)
+            pitch_points.append(
+                f"You have a **strong GBP reputation ({gbp_rating} stars from {gbp_reviews} reviews)**, which is fantastic. However, your website's fundamentals (H1/NAP) are holding back those customers from converting once they click through. We can double your lead volume."
+            )
+        elif gbp_score in ["Weak", "Missing"]:
+            # Target 2: Losing on Both Fronts (Major Opportunity)
+            pitch_points.append(
+                f"Your website has fundamental SEO gaps (H1/NAP), and your **GBP profile is weak** ({gbp_rating} stars from {gbp_reviews} reviews). By fixing your website AND implementing a review generation system, you could dominate the Map Pack."
+            )
+
+    # If no major SEO pitch was made (i.e., SEO is good but GBP is weak)
+    if not pitch_points and gbp_score in ["Weak", "Missing"]:
+        pitch_points.append(
+            f"Your website is well-optimized, but your **GBP profile is weak** ({gbp_rating} stars from {gbp_reviews} reviews). We can focus on generating reviews to secure the Map Pack and maximize the power of your current rankings."
+        )
+
+    # --- 3. STANDARD SEO GAPS (Only if not already covered by GBP pitch) ---
+    if not any("H1" in p for p in pitch_points):
         if "Irrelevant" in h1_status:
              pitch_points.append(
-            "Your main headline (H1) doesn't mention your core service or city. Google relies on this to rank you. Fixing this is the **fastest way to improve visibility**."
-        )
+                "Your main headline (H1) doesn't mention your core service or city. Google relies on this to rank you. Fixing this is the **fastest way to improve visibility**."
+            )
         elif "Missing" in h1_status:
             pitch_points.append(
                 "Missing a crucial H1 heading on your homepage! Search engines rely on this to know what you do. This is the **fastest way to improve your visibility**."
             )
-
-    # Check 4: NAP Failure
-    nap_status = row['NAP_Audit_Result']
-    if nap_status.startswith("Fail"):
+    
+    if not any("NAP" in p for p in pitch_points) and nap_status.startswith("Fail"):
         pitch_points.append(
             "Can't find your phone number or address quickly. This hurts user trust and is a **critical fix for local SEO rankings** (the 'Map Pack')."
         )
-    
-    # Check 5: Title & Meta Description Failures
+        
+    # --- 4. SECONDARY GAPS ---
     if row['Title_Status'].startswith("Fail"):
         pitch_points.append(f"Your title tag is {row['Title_Status'].split(':')[1].strip().lower()}. This is your first impression to Google and potential customers.")
     
     if row['Meta_Desc_Status'].startswith("Fail: Missing"):
         pitch_points.append("You are missing a crucial Meta Description, leaving Google to write its own (often poor) one for your search results.")
 
-    # Check 6: Schema Failure
     schema_status = row['Schema_Issue']
     if schema_status.startswith("Fail"):
         pitch_points.append(
@@ -343,28 +450,64 @@ def generate_sales_pitch(row):
         )
 
     if pitch_points:
-        return " | ".join(pitch_points)
+        return intro_statement + " | ".join(pitch_points)
     else:
-        return "Audit Passed! Top-tier SEO, requires a more advanced audit."
+        return intro_statement + "None! Your site is strong. We specialize in advanced strategies (authority building, conversion rate optimization) to take you from #10 to #1."
     
 def create_final_report(df):
     """
-    Applies the sales pitch logic, cleans up columns, and exports the final report.
+    Applies the sales pitch logic, cleans up columns, and exports the final report
+    into two formats:
+    1. A simplified CSV for cold outreach tools (Instantly.ai).
+    2. A detailed XLSX for human review and internal data storage.
     """
     
     if df.empty:
         print("Report not generated: No unique prospects found.")
         return
         
-    # 1. Generate the Sales Pitch
-    print("-> Generating sales pitches...")
-    df['Sales_Pitch'] = df.apply(generate_sales_pitch, axis=1)
+    # 1. Generate the Sales Pitch (if not already done)
+    if 'Sales_Pitch' not in df.columns:
+        print("-> Generating sales pitches...")
+        df['Sales_Pitch'] = df.apply(generate_sales_pitch, axis=1)
     
     # 2. Add an 'Actionable' filter column
     df['Actionable_Target'] = df['Sales_Pitch'].apply(lambda x: 'YES' if 'Fail' in x or 'Error' in x or 'Critical' in x else 'NO')
 
-    # 3. Reorder and Select Final Columns (Updated for new checks)
-    final_columns = [
+    # --- CSV EXPORT FOR INSTANTLY.AI (Simplified Structure) ---
+    print("\n--- EXPORTING INSTANTLY.AI CSV ---")
+    
+    # Create clean columns for seamless import (no spaces/special chars in names)
+    df['Prospect_Name'] = df['Company_Name'].apply(lambda x: x if x and x != 'N/A' else 'Client')
+    df['Final_Pitch'] = df['Sales_Pitch']
+    df['Website_URL'] = df['URL']
+    df['Rank_Found'] = df['Rank']
+    
+    instantly_columns = [
+        'Actionable_Target',
+        'Prospect_Name', 
+        'Website_URL',
+        'Final_Pitch',
+        'Keyword',
+        'City',
+        'Rank_Found',
+        'Phone_Number'
+    ]
+    
+    # Filter only actionable targets for the cold email list
+    df_instantly = df[df['Actionable_Target'] == 'YES'][instantly_columns]
+    
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    csv_filename = f"Instantly_Import_Actionable_{timestamp}.csv"
+    
+    df_instantly.to_csv(csv_filename, index=False)
+    print(f"File: {csv_filename} (Ready for Instantly.ai/Outreach Import)")
+
+    # --- EXCEL EXPORT FOR HUMAN REVIEW (Detailed Audit Report) ---
+    print("\n--- EXPORTING DETAILED AUDIT XLSX ---")
+
+    # Full set of detailed columns for the human report
+    detailed_columns = [
         'Actionable_Target',
         'Rank',
         'Company_Name',
@@ -372,7 +515,7 @@ def create_final_report(df):
         'City',
         'URL',
         'Title',
-        'Sales_Pitch',
+        'Final_Pitch',
         'H1_Audit_Result',
         'NAP_Audit_Result',
         'Phone_Number',
@@ -380,36 +523,30 @@ def create_final_report(df):
         'Title_Status',
         'Meta_Desc_Status',
         'Schema_Issue',
+        'GBP_Rating',
+        'GBP_Review_Count',
         'Error_Status',
         'Snippet',
         'Target_Query'
     ]
     
-    # Ensure columns exist (especially for new ones)
-    for col in final_columns:
+    # Ensure all columns exist before selecting
+    for col in detailed_columns:
         if col not in df.columns:
             df[col] = ''
+    
+    df_report_full = df[detailed_columns]
+    
+    xlsx_filename = f"SEO_Detailed_Audit_{timestamp}.xlsx"
+    df_report_full.to_excel(xlsx_filename, index=False)
 
-    df_report = df[final_columns]
-    
-    # 4. Sort and Export
-    df_report = df_report.sort_values(by=['Actionable_Target', 'Rank'], ascending=[False, True])
-    
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    filename = f"SEO_Prospect_Report_{timestamp}.csv"
-    
-    df_report.to_csv(filename, index=False)
-    
-    success_count = len(df_report[df_report['Error_Status'] == 'Success'])
-    error_count = len(df_report[df_report['Error_Status'] != 'Success'])
-    actionable_count = len(df_report[df_report['Actionable_Target'] == 'YES'])
+    # --- FINAL SUMMARY ---
+    actionable_count = len(df_instantly)
 
     print(f"\n[SUCCESS] Final report created!")
-    print(f"File: {filename}")
-    print(f"Total Unique Prospects Audited: {len(df_report)}")
-    print(f"Successful Audits: {success_count}")
-    print(f"Connection/HTTP Errors: {error_count}")
-    print(f"Total Actionable Leads (Found 1+ Fix): {actionable_count}")
+    print(f"Human Readable File: {xlsx_filename}")
+    print(f"Total Unique Prospects Audited: {len(df_report_full)}")
+    print(f"Total Actionable Leads (Ready for Outreach): {actionable_count}")
     print("The script is complete. Run finished.")
 
 if __name__ == '__main__':
@@ -460,6 +597,30 @@ if __name__ == '__main__':
         print("\n--- STARTING DATA CLEANUP ---")
         cleaned_df = clean_and_deduplicate(results_data) 
         print(f"Total unique URLs after cleaning: {cleaned_df.shape[0]}")
+        
+        # 4.5 GBP Data Collection
+        print("\n--- STARTING GBP DATA COLLECTION ---")
+        gbp_place_ids = []
+        gbp_ratings = []
+        gbp_reviews = []
+        
+        # Run GBP audit once per Keyword/City combination, then apply to all rows for that query
+        for city in CITIES:
+            for keyword in KEYWORDS:
+                print(f"-> Fetching GBP data for: '{keyword} {city}'")
+                
+                # Fetch GBP data
+                gbp_results = serpapi_gbp_extractor(keyword, city, SERPAPI_API_KEY)
+                
+                # Identify all rows belonging to the current keyword/city pair
+                mask = (cleaned_df['Keyword'] == keyword) & (cleaned_df['City'] == city)
+                
+                # Apply the fetched GBP data to all matching rows
+                cleaned_df.loc[mask, 'GBP_Place_ID'] = gbp_results['GBP_Place_ID']
+                cleaned_df.loc[mask, 'GBP_Rating'] = gbp_results['GBP_Rating']
+                cleaned_df.loc[mask, 'GBP_Review_Count'] = gbp_results['GBP_Review_Count']
+                
+        print("--- GBP DATA COLLECTION COMPLETE ---")
         
         # 5. On-Page Auditor
         if not cleaned_df.empty:
