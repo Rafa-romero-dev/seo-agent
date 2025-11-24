@@ -1,15 +1,16 @@
-# 1. Target Cities (List of cities where clients are located or prospects are being searched)
+# --- CITIES: smaller MSA cities for better targeting ---
 CITIES = [
-    "Houston",
-    "Dallas",
-    "San Antonio",
-    "Austin"
+    "Lamesa, TX",
+    "Vernon, TX",
 ]
 
-# 2. Diesel Industry Keywords (High-intent local search terms)
+# --- KEYWORDS: Core Diesel Repair Services ---
 KEYWORDS = [
     "heavy duty truck repair",
+    "diesel engine repair",
     "fleet maintenance service",
     "Cummins engine repair",
-    "diesel alignment shop"
+    "semi truck repair near me",
+    "commercial vehicle inspection",
+    "mobile diesel mechanic",
 ]

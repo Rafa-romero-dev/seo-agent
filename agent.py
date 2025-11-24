@@ -9,84 +9,111 @@ import time
 import random
 import re
 import argparse
+from requests.exceptions import RequestException
 
 # Load environment variables from .env file
 load_dotenv()
 
+# List of common User-Agents to rotate (Prevents 403 Forbidden errors)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/605.1.15",
+]
+
+# Domains to filter out
+DIRECTORY_DOMAINS = [
+    'yelp.com', 'google.com', 'facebook.com', 'linkedin.com', 'yellowpages.com', 
+    'mapquest.com', 'angieslist.com', 'thumbtack.com', 'bbb.org', 'nextdoor.com',
+    'porch.com', 'cargurus.com', 'mechanicadvisor.com', 'repairpal.com'
+]
+
 # Global data list to store results
 results_data = []
 
-def serpapi_extractor(keyword, city, start_page, end_page, api_key):
+def serpapi_extractor(keyword, city, start_page, end_page, api_key, max_api_retries=3):
     """
-    Fetches SERP data from Google using the SerpApi.
-    ... (docstring for Args and Returns)
+    Fetches SERP data from Google using the SerpApi with retry logic.
     """
     extracted_results = []
-    
-    # Calculate starting index (st) for the first page
     start_index = (start_page - 1) * 10 
     
-    # Iterate through the pages/rank offsets
     for current_rank in range(start_index, (end_page * 10), 10):
-        # The SerpApi parameters
-        params = {
-            "api_key": api_key,
-            "engine": "google",
-            "q": f"{keyword} {city}",
-            "location": city,
-            "hl": "en",
-            "start": current_rank,
-            "num": 10
-        }
         
-        try:
-            search = GoogleSearch(params)
-            results = search.get_dict()
+        for attempt in range(max_api_retries):
+            params = {
+                "api_key": api_key,
+                "engine": "google",
+                "q": f"{keyword} {city}",
+                "location": city,
+                "hl": "en",
+                "start": current_rank,
+                "num": 10
+            }
             
-            if 'error' in results:
-                print(f"  -> SERP API Error: {results['error']}")
-                break
+            try:
+                search = GoogleSearch(params)
+                results = search.get_dict()
                 
-            organic_results = results.get("organic_results", [])
-            
-            if not organic_results:
-                print(f"  -> No more results found after rank {current_rank}. Stopping.")
-                break
+                if 'error' in results:
+                    error_msg = results['error']
+                    # Check for rate limit or transient errors
+                    if any(err in error_msg.lower() for err in ["rate limit", "internal server error"]):
+                        print(f"-> SERP API Transient Error: {error_msg}. Retrying in {2**attempt}s...")
+                        time.sleep(2 ** attempt + random.uniform(0, 1))
+                        continue # Go to next attempt
+                    else:
+                        print(f"-> SERP API Fatal Error: {error_msg}")
+                        return extracted_results # Stop extraction
+                
+                organic_results = results.get("organic_results", [])
+                
+                if not organic_results and current_rank == start_index:
+                    print(f"-> No results found for this query.")
+                    break # Break retry loop, then break rank loop
+                elif not organic_results:
+                    print(f"-> No more results found after rank {current_rank}. Stopping.")
+                    break # Break retry loop, then break rank loop
 
-            for i, result in enumerate(organic_results):
-                rank = current_rank + i + 1
+                for i, result in enumerate(organic_results):
+                    rank = current_rank + i + 1
+                    
+                    if 'link' in result and 'google.com' not in result['link']:
+                        extracted_results.append({
+                            'Rank': rank,
+                            'URL': result['link'],
+                            'Title': result['title'],
+                            'Snippet': result.get('snippet', 'No Snippet Found'),
+                            'Keyword': keyword,
+                            'City': city,
+                            'Target_Query': f"{keyword} {city}",
+                            'H1_Audit_Result': '',
+                            'NAP_Audit_Result': '',
+                            'Schema_Issue': '',
+                            'Error_Status': '',
+                            'Company_Name': ''
+                        })
                 
-                if 'link' in result and 'google.com' not in result['link']:
-                    extracted_results.append({
-                        'Rank': rank,
-                        'URL': result['link'],
-                        'Title': result['title'],
-                        'Snippet': result.get('snippet', 'No Snippet Found'),
-                        'Keyword': keyword,
-                        'City': city,
-                        'Target_Query': f"{keyword} {city}",
-                        'On_Page_H1_Status': '',
-                        'On_Page_NAP_Issue': ''
-                    })
-            
-            # Note: We can't access credit info easily without another call or parsing,
-            # so we'll simplify the printout for the blog
-            print(f"  -> Fetched 10 results starting at rank {current_rank}.")
-            
-            time.sleep(random.uniform(1, 3)) 
-            
-        except Exception as e:
-            print(f"  -> Critical API Request Error: {e}")
-            break
+                print(f"-> Fetched 10 results starting at rank {current_rank}.")
+                time.sleep(random.uniform(1, 3)) 
+                break # Success, break retry loop
+
+            except Exception as e:
+                print(f"-> Critical API Request Error: {e.__class__.__name__}. Retrying in {2**attempt}s...")
+                time.sleep(2 ** attempt + random.uniform(0, 1))
+        
+        else: # Runs if the inner loop completes without break (all retries failed)
+            print(f"-> Max API retries exceeded for rank {current_rank}. Moving to next query.")
+            break # Break rank loop
             
     return extracted_results
 
 def clean_and_deduplicate(raw_data):
     """
-    Converts raw list data to a DataFrame, normalizes URLs, and removes duplicates.
-    ... (docstring for Args and Returns)
+    Converts raw list data to a DataFrame, filters directories, normalizes URLs, and removes duplicates.
     """
-    
     if not raw_data:
         print("No data to clean.")
         return pd.DataFrame()
@@ -96,13 +123,22 @@ def clean_and_deduplicate(raw_data):
     def normalize_url(url):
         if not isinstance(url, str):
             return url
+        # Enhanced normalization
         url = url.replace("https://", "").replace("http://", "")
+        url = url.split('#')[0].split('?')[0] # Remove fragments and query strings
         url = url.rstrip('/')
         if url.startswith("www."):
             url = url[4:]
         return url
         
     df['Normalized_URL'] = df['URL'].apply(normalize_url)
+    
+    def is_directory(url):
+        return any(domain in url.lower() for domain in DIRECTORY_DOMAINS)
+
+    df['Is_Directory'] = df['Normalized_URL'].apply(is_directory)
+    # Keep only non-directory sites
+    df = df[df['Is_Directory'] == False].drop(columns=['Is_Directory'])
     
     # Deduplicate: Keep the row with the BEST (lowest) Rank
     df_unique = df.sort_values(by=['Normalized_URL', 'Rank'], ascending=[True, True])
@@ -112,115 +148,200 @@ def clean_and_deduplicate(raw_data):
     
     return df_cleaned
 
-def run_on_page_audit(url: str, max_retries: int = 3) -> dict:
+def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -> dict: # Increased retries
     """
-    Performs quick, non-intrusive SEO checks (H1, basic NAP) on a given URL.
-
-    Args:
-        url (str): The prospect's website URL.
-        max_retries (int): Maximum number of attempts for the request.
-
-    Returns:
-        dict: Status of key SEO elements (H1, NAP).
+    Performs quick, non-intrusive SEO checks on a given URL.
+    Uses User-Agent rotation and retries.
     """
-
+    # --- AUDIT DATA INITIALIZATION ---
     audit_data = {
-        'H1_Status': 'Fail: H1 Missing or Empty',
-        'NAP_Issue': 'Fail: NAP Info Not Found/Clear'
+        'H1_Audit_Result': 'Fail: H1 Missing or Empty',
+        'Title_Status': 'Fail: Title Not Found',
+        'Meta_Desc_Status': 'Fail: Missing Meta Description',
+        'NAP_Audit_Result': 'Fail: NAP Info Not Found/Clear',
+        'Schema_Issue': 'Fail: No LocalBusiness Schema Found',
+        'Robots_Status': 'Pass: Index/Follow',
+        'Phone_Number': 'N/A',
+        'Company_Name': 'N/A' ,
+        'Error_Status': 'Success'
     }
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
     response = None
 
     for attempt in range(max_retries):
         try:
-            # Note: The timeout is part of the request logic, not the retry logic
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
+            # --- ROTATE USER AGENT & SLOWER RETRY SLEEP ---
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept-Language': 'en-US,en;q=0.9'
+            }
+            
+            # Use longer, randomized sleep before retries
+            if attempt > 0:
+                # Slower, randomized sleep for HTTP retries
+                sleep_time = random.uniform(3, 5) 
+                print(f"-> Retrying in {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status() 
+            
+            # If we get here, the request was successful (200 OK)
             break
         
-        except requests.exceptions.RequestException as e:
-            # Handle all connection-level issues (Timeout, ConnectionError, HTTPError, etc.)
-            print(f"  -> Error on {url} (Attempt {attempt + 1}/{max_retries}): {e.__class__.__name__}. Retrying...")
-            time.sleep(1)
+        except RequestException as e:
+            error_class_name = e.__class__.__name__
+            print(f"-> Error on {url} (Attempt {attempt + 1}/{max_retries}): {error_class_name}. Retrying...")
             
-            # If this was the final attempt, the error will be handled outside the loop.
             if attempt == max_retries - 1:
-                # Store the final error for handling outside the loop
-                audit_data['H1_Status'] = f"Error: Request Failed ({e.__class__.__name__})"
+                audit_data['H1_Audit_Result'] = f"Error: Request Failed ({error_class_name})"
+                audit_data['Error_Status'] = f"Error: {error_class_name}"
                 return audit_data
-
+            
+    # --- PARSING LOGIC (Only runs if request succeeded) ---
     try:
-        # Check if response object exists and is successful (200, no raise_for_status() error)
-        # Note: raise_for_status() is handled in the loop, but this ensures a response was received.
-        if response and response.status_code == 200:
+        if response and response.content:
+            # Explicitly check for content to avoid errors on empty responses
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # 1. H1 Check
-            h1_tag = soup.find('h1')
-            h1_text = h1_tag.get_text(strip=True) if h1_tag else ''
-            if h1_text:
-                audit_data['H1_Status'] = f"Pass: {h1_text[:50]}..."
-            
-            # 2. NAP Check
-            phone_patterns = r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}" # Common phone number regex
-            
-            # Search the entire body text
-            search_text = soup.body.get_text() if soup.body else soup.get_text()
-            if re.search(phone_patterns, search_text):
-                audit_data['NAP_Issue'] = 'Pass: Phone Number Found'
+            # --- Company Name Extraction ---
+            if soup.title and soup.title.string:
+                title_text = soup.title.string.strip()
+                # Use a robust split based on common separators
+                company_name_part = re.split(r'[-|:-]', title_text)[0].strip()
+                audit_data['Company_Name'] = company_name_part or 'N/A'
+                
+                # --- Title Check ---
+                if len(title_text) < 10 or "Home" in title_text or "Default" in title_text:
+                    audit_data['Title_Status'] = "Fail: Weak/Default Title Tag"
+                else:
+                    audit_data['Title_Status'] = f"Pass: {title_text[:30]}..."
             else:
-                # Check the footer specifically
-                footer = soup.find('footer')
-                if footer and re.search(phone_patterns, footer.get_text()):
-                    audit_data['NAP_Issue'] = 'Pass: Phone Number Found (in footer)'
+                audit_data['Title_Status'] = "Fail: Missing Title Tag"
 
-        elif response and response.status_code != 200:
-            # Handle final non-200 status codes not caught by the loop's raise_for_status 
-            audit_data['H1_Status'] = f"Error: HTTP {response.status_code}"
+            # --- Meta Description Check ---
+            meta_desc = soup.find('meta', attrs={'name': 'description'})
+            if meta_desc and meta_desc.get('content'):
+                desc_content = meta_desc['content'].strip()
+                if len(desc_content) > 20:
+                    audit_data['Meta_Desc_Status'] = f"Pass: {desc_content[:30]}..."
+                else:
+                    audit_data['Meta_Desc_Status'] = "Fail: Empty or Very Short Meta Description"
+            else:
+                audit_data['Meta_Desc_Status'] = "Fail: Missing Meta Description"
+            
+            # --- H1 Check (Keyword Relevance) ---
+            h1_tag = soup.find('h1')
+            if h1_tag:
+                h1_text = h1_tag.get_text(strip=True)
+                if h1_text:
+                    # Check if the keyword or city is mentioned (Case insensitive)
+                    if keyword.lower() in h1_text.lower() or city.lower() in h1_text.lower():
+                        audit_data['H1_Audit_Result'] = f"Pass: {h1_text[:50]}..."
+                    else:
+                        audit_data['H1_Audit_Result'] = f"Fail: Irrelevant H1 ({h1_text[:30]}...)"
+                # If H1 tag exists but is empty, it remains 'Fail: H1 Missing or Empty' from initialization
+            
+            # --- NAP Check (Extraction + Status) ---
+            # Looks for phone number OR common address markers (St, Rd, Ave, Zip Code)
+            phone_regex = r"(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})"
+            nap_regex = phone_regex + r"|(\b\d{5}(?:-\d{4})?\b)|(\b(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Suite|Unit)\b)"
+            
+            search_text = soup.body.get_text() if soup.body else soup.get_text()
+            
+            # 1. NAP Status Check
+            if re.search(nap_regex, search_text, re.IGNORECASE):
+                audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found'
+                # 2. NAP Data Extraction
+                phone_match = re.search(phone_regex, search_text)
+                if phone_match:
+                    audit_data['Phone_Number'] = phone_match.group(0).strip()
+            else:
+                footer = soup.find('footer')
+                if footer and re.search(nap_regex, footer.get_text(), re.IGNORECASE):
+                    audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found (in footer)'
+
+            # --- Schema Markup Check ---
+            schema_scripts = soup.find_all('script', type='application/ld+json')
+            for script in schema_scripts:
+                # Use script.string to safely access content
+                if script.string and ('LocalBusiness' in script.string or 'Organization' in script.string):
+                    audit_data['Schema_Issue'] = 'Pass: LocalBusiness/Organization Schema Found'
+                    break
+            
+            # --- Meta Robots Tag Check ---
+            meta_robots = soup.find('meta', attrs={'name': 'robots'})
+            if meta_robots and meta_robots.get('content'):
+                content = meta_robots['content'].lower()
+                if 'noindex' in content:
+                    audit_data['Robots_Status'] = 'Fail: NOINDEX tag found'
+                elif 'nofollow' in content:
+                    audit_data['Robots_Status'] = 'Fail: NOFOLLOW tag found'
+            
             
     except Exception as e:
-        # This catches errors during parsing (e.g., in BeautifulSoup, re.search, etc.)
-        audit_data['H1_Status'] = f"Error: Parsing/Internal Failure ({e.__class__.__name__})"
+        # Handle parsing failures gracefully
+        error_class_name = e.__class__.__name__
+        audit_data['H1_Audit_Result'] = f"Error: Parsing Failure ({error_class_name})"
+        audit_data['Error_Status'] = f"Error: Parsing Failure ({error_class_name})"
     
     return audit_data
 
 def generate_sales_pitch(row):
     """
     Generates a personalized, concise sales pitch based on audit failures.
-    
-    Args:
-        row (pd.Series): A row from the audited DataFrame.
-        
-    Returns:
-        str: The full, actionable sales pitch text.
     """
-    
     pitch_points = []
     
-    # Check 1: H1 Failure (High-Impact SEO Issue)
+    # Check 1: Technical Error
+    if row.get('Error_Status') != 'Success':
+          pitch_points.append(
+            f"Your website returned an error ({row.get('Error_Status').split('(')[0].strip()}) when we tried to audit it. This suggests a potential **server or site health issue** that needs immediate attention."
+        )
+
+    if "Request Failed" in row.get('Error_Status') or "Parsing Failure" in row.get('Error_Status'):
+        return " | ".join(pitch_points)
+    
+    # Check 2: Meta Robots Failure
+    robots_status = row['Robots_Status']
+    if robots_status.startswith("Fail: NOINDEX"):
+        pitch_points.append(
+            "Critical Issue: Your homepage has a **'NOINDEX' tag**, meaning Google is blocked from showing you in search results! This is the most urgent fix."
+        )
+
+    # Check 3: H1 Failure
     h1_status = row['H1_Audit_Result']
     if h1_status.startswith("Fail"):
-        pitch_points.append(
-            "Missing a crucial H1 heading on your homepage! Search engines rely on this to know what you do. This is the **fastest way to improve your visibility**."
+        if "Irrelevant" in h1_status:
+             pitch_points.append(
+            "Your main headline (H1) doesn't mention your core service or city. Google relies on this to rank you. Fixing this is the **fastest way to improve visibility**."
         )
-    
-    # Check 2: NAP Failure (Trust & Local SEO Issue)
+        elif "Missing" in h1_status:
+            pitch_points.append(
+                "Missing a crucial H1 heading on your homepage! Search engines rely on this to know what you do. This is the **fastest way to improve your visibility**."
+            )
+
+    # Check 4: NAP Failure
     nap_status = row['NAP_Audit_Result']
     if nap_status.startswith("Fail"):
         pitch_points.append(
             "Can't find your phone number or address quickly. This hurts user trust and is a **critical fix for local SEO rankings** (the 'Map Pack')."
         )
-        
-    # Check 3: General Failure/Error
-    if "Error" in h1_status:
+    
+    # Check 5: Title & Meta Description Failures
+    if row['Title_Status'].startswith("Fail"):
+        pitch_points.append(f"Your title tag is {row['Title_Status'].split(':')[1].strip().lower()}. This is your first impression to Google and potential customers.")
+    
+    if row['Meta_Desc_Status'].startswith("Fail: Missing"):
+        pitch_points.append("You are missing a crucial Meta Description, leaving Google to write its own (often poor) one for your search results.")
+
+    # Check 6: Schema Failure
+    schema_status = row['Schema_Issue']
+    if schema_status.startswith("Fail"):
         pitch_points.append(
-            f"Your website returned an error ({h1_status.split(':')[-1].strip()}) when we tried to audit it. This suggests a potential **server or site health issue** that needs immediate attention."
+            "You are missing Structured Data (Schema Markup). Adding 'LocalBusiness' schema is essential for Google to understand your services and is a huge factor for Map visibility."
         )
 
-    # Compile the final pitch
     if pitch_points:
         return " | ".join(pitch_points)
     else:
@@ -229,9 +350,6 @@ def generate_sales_pitch(row):
 def create_final_report(df):
     """
     Applies the sales pitch logic, cleans up columns, and exports the final report.
-    
-    Args:
-        df (pd.DataFrame): The fully audited DataFrame.
     """
     
     if df.empty:
@@ -239,16 +357,17 @@ def create_final_report(df):
         return
         
     # 1. Generate the Sales Pitch
-    print("  -> Generating sales pitches...")
+    print("-> Generating sales pitches...")
     df['Sales_Pitch'] = df.apply(generate_sales_pitch, axis=1)
     
-    # 2. Add an 'Actionable' filter column (only target those with failures)
-    df['Actionable_Target'] = df['Sales_Pitch'].apply(lambda x: 'YES' if 'Fail' in x or 'Error' in x else 'NO')
+    # 2. Add an 'Actionable' filter column
+    df['Actionable_Target'] = df['Sales_Pitch'].apply(lambda x: 'YES' if 'Fail' in x or 'Error' in x or 'Critical' in x else 'NO')
 
-    # 3. Reorder and Select Final Columns for the Report
+    # 3. Reorder and Select Final Columns (Updated for new checks)
     final_columns = [
-        'Actionable_Target', # Sort by this first
+        'Actionable_Target',
         'Rank',
+        'Company_Name',
         'Keyword',
         'City',
         'URL',
@@ -256,10 +375,21 @@ def create_final_report(df):
         'Sales_Pitch',
         'H1_Audit_Result',
         'NAP_Audit_Result',
+        'Phone_Number',
+        'Robots_Status',
+        'Title_Status',
+        'Meta_Desc_Status',
+        'Schema_Issue',
+        'Error_Status',
         'Snippet',
         'Target_Query'
     ]
     
+    # Ensure columns exist (especially for new ones)
+    for col in final_columns:
+        if col not in df.columns:
+            df[col] = ''
+
     df_report = df[final_columns]
     
     # 4. Sort and Export
@@ -270,9 +400,16 @@ def create_final_report(df):
     
     df_report.to_csv(filename, index=False)
     
+    success_count = len(df_report[df_report['Error_Status'] == 'Success'])
+    error_count = len(df_report[df_report['Error_Status'] != 'Success'])
+    actionable_count = len(df_report[df_report['Actionable_Target'] == 'YES'])
+
     print(f"\n[SUCCESS] Final report created!")
     print(f"File: {filename}")
-    print(f"Total Actionable Leads: {df_report['Actionable_Target'].value_counts().get('YES', 0)}")
+    print(f"Total Unique Prospects Audited: {len(df_report)}")
+    print(f"Successful Audits: {success_count}")
+    print(f"Connection/HTTP Errors: {error_count}")
+    print(f"Total Actionable Leads (Found 1+ Fix): {actionable_count}")
     print("The script is complete. Run finished.")
 
 if __name__ == '__main__':
@@ -284,7 +421,7 @@ if __name__ == '__main__':
         print("Please set the variable before running the script (e.g., export SERPAPI_API_KEY='YOUR_KEY').")
         exit()
 
-    # 2. Parse Command-Line Arguments for Page Range
+    # 2. Parse Command-Line Arguments
     parser = argparse.ArgumentParser(description="SEO Prospect Agent: Scrapes SERPs and audits prospects.")
     parser.add_argument('start_page', type=int, help='The starting Google SERP page number (e.g., 2).')
     parser.add_argument('end_page', type=int, help='The ending Google SERP page number (e.g., 5).')
@@ -324,48 +461,34 @@ if __name__ == '__main__':
         cleaned_df = clean_and_deduplicate(results_data) 
         print(f"Total unique URLs after cleaning: {cleaned_df.shape[0]}")
         
-        # 4.5. Filter out Directory/Social Sites
-        directory_domains = ['yelp.com', 'google.com/maps', 'yellowpages.com', 'facebook.com', 'linkedin.com']
-        print("\n--- Filtering Directory/Social Sites ---")
-        initial_count = cleaned_df.shape[0]
-        
-        def is_directory(url):
-            return any(domain in url.lower() for domain in directory_domains)
-
-        cleaned_df['Is_Directory'] = cleaned_df['URL'].apply(is_directory)
-        cleaned_df_filtered = cleaned_df[cleaned_df['Is_Directory'] == False].drop(columns=['Is_Directory'])
-
-        print(f"Removed {initial_count - cleaned_df_filtered.shape[0]} directory URLs.")
-        print(f"Total URLs to audit: {cleaned_df_filtered.shape[0]}")
-        
         # 5. On-Page Auditor
-        if not cleaned_df_filtered.empty:
+        if not cleaned_df.empty:
             print("\nReady to begin On-Page Auditing of unique prospects.")
             
-            # Prepare lists to hold the audit results
-            h1_statuses = []
-            nap_issues = []
+            # Prepare lists for audit results (must match keys in run_on_page_audit)
+            audit_results_list = []
             
-            for index, row in cleaned_df_filtered.iterrows():
+            # Loop through rows
+            for index, row in cleaned_df.iterrows():
                 url = row['URL']
-                # Correct index+1 for readable output
-                print(f"  -> Auditing {index+1}/{cleaned_df_filtered.shape[0]}: {url}") 
+                print(f"  -> Auditing {index+1}/{cleaned_df.shape[0]}: {url}") 
                 
-                audit_results = run_on_page_audit(url)
+                audit_results = run_on_page_audit(url, row['Keyword'], row['City'])
                 
-                h1_statuses.append(audit_results['H1_Status'])
-                nap_issues.append(audit_results['NAP_Issue'])
+                # Append the results dictionary along with the original row data
+                # Merge the audit results back into the DataFrame row
+                for key, value in audit_results.items():
+                    # Use a conditional assignment to set the column data
+                    # This is slightly more verbose but avoids pre-creating 
+                    # dozens of empty lists and appending to them one by one.
+                    cleaned_df.loc[index, key] = value
                 
-                # Add a small delay between site requests
                 time.sleep(random.uniform(0.5, 1.5))
-                
-            cleaned_df_filtered['H1_Audit_Result'] = h1_statuses
-            cleaned_df_filtered['NAP_Audit_Result'] = nap_issues
                 
             print("\n--- ON-PAGE AUDIT COMPLETE ---")
                 
         # 6. Data Consolidation & Reporting
-        create_final_report(cleaned_df_filtered)
+        create_final_report(cleaned_df)
             
     except Exception as e:
         print(f"\n[FATAL ERROR] An error occurred: {e}")
