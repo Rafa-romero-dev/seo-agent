@@ -528,37 +528,67 @@ def generate_sales_pitch(row):
         "We specialize in taking established sites like yours to the top spot."
     )
 
+def is_actionable(row):
+    """
+    Determines if a prospect is actionable based on Data Columns.
+    """
+    # 1. SKIP BLOCKED SITES (Firewalls, 403s)
+    if row.get('Final_Pitch') == "SKIP":
+        return 'NO'
+
+    # 2. YES: Critical Technical Errors (NOINDEX)
+    if "Fail" in row.get('Robots_Status', ''):
+        return 'YES'
+
+    # 3. YES: Genuine Server Errors (Timeouts, SSL Errors)
+    error_status = row.get('Error_Status', '')
+    if error_status and "Error" in error_status and error_status != "Success":
+        return 'YES'
+
+    # 4. YES: SEO Gaps (H1 or NAP)
+    h1_fail = "Fail" in row.get('H1_Audit_Result', '')
+    nap_fail = "Fail" in row.get('NAP_Audit_Result', '')
+    
+    if h1_fail or nap_fail:
+        return 'YES'
+
+    # 5. NO: Everything else (Perfect sites)
+    return 'NO'
+
 def create_final_report(df):
     """
-    Applies the sales pitch logic, cleans up columns, and exports the final report
-    into two formats:
-    1. A simplified CSV for cold outreach tools (Instantly.ai).
-    2. A detailed XLSX for human review and internal data storage.
+    Applies the sales pitch logic, cleans up columns, and exports the final report.
     """
     
     if df.empty:
         print("Report not generated: No unique prospects found.")
         return
         
-    # Generate the Sales Pitch
+    # 1. Generate the Sales Pitch
     if 'Sales_Pitch' not in df.columns:
         print("-> Generating sales pitches...")
         df['Sales_Pitch'] = df.apply(generate_sales_pitch, axis=1)
-
-    # Remove rows where the pitch is "SKIP" (Blocked sites)
-    df = df[df['Sales_Pitch'] != "SKIP"]
     
-    # Add an 'Actionable' filter column
-    df['Actionable_Target'] = df['Sales_Pitch'].apply(lambda x: 'YES' if 'Fail' in x or 'Error' in x or 'Critical' in x else 'NO')
+    # 2. Filter out explicit "SKIP" rows and create a fresh copy
+    df = df[df['Sales_Pitch'] != "SKIP"].copy()
+
+    if df.empty:
+        print("All prospects were filtered out (Blocked/Skipped). No report generated.")
+        return
+
+    # 3. Rename/Map columns for the report
+    df['Final_Pitch'] = df['Sales_Pitch']
+    df['Website_URL'] = df['URL']
+    df['Rank_Found'] = df['Rank']
+
+    # 4. Determine Actionability based on DATA, not Pitch Text
+    df['Actionable_Target'] = df.apply(is_actionable, axis=1)
 
     # --- CSV EXPORT FOR INSTANTLY.AI (Simplified Structure) ---
     print("\n--- EXPORTING INSTANTLY.AI CSV ---")
     
-    # Create clean columns for seamless import (no spaces/special chars in names)
+    # Create clean Prospect Name
     df['Prospect_Name'] = df['Company_Name'].apply(lambda x: x if x and x != 'N/A' else 'Client')
-    df['Final_Pitch'] = df['Sales_Pitch']
-    df['Website_URL'] = df['URL']
-    df['Rank_Found'] = df['Rank']
     
     instantly_columns = [
         'Actionable_Target',
@@ -572,7 +602,7 @@ def create_final_report(df):
     ]
     
     # Filter only actionable targets for the cold email list
-    df_instantly = df[df['Actionable_Target'] == 'YES'][instantly_columns]
+    df_instantly = df[df['Actionable_Target'] == 'YES'][instantly_columns].copy()
     
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     csv_filename = f"Instantly_Import_Actionable_{timestamp}.csv"
@@ -583,7 +613,6 @@ def create_final_report(df):
     # --- EXCEL EXPORT FOR HUMAN REVIEW (Detailed Audit Report) ---
     print("\n--- EXPORTING DETAILED AUDIT XLSX ---")
 
-    # Full set of detailed columns for the human report
     detailed_columns = [
         'Actionable_Target',
         'Rank',
