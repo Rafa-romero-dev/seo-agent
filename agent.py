@@ -25,9 +25,34 @@ USER_AGENTS = [
 
 # Domains to filter out
 DIRECTORY_DOMAINS = [
-    'yelp.com', 'google.com', 'facebook.com', 'linkedin.com', 'yellowpages.com', 
-    'mapquest.com', 'angieslist.com', 'thumbtack.com', 'bbb.org', 'nextdoor.com',
-    'porch.com', 'cargurus.com', 'mechanicadvisor.com', 'repairpal.com'
+    # --- Job Boards ---
+    'indeed', 'glassdoor', 'ziprecruiter', 'simplyhired', 'linkedin', 
+    'snagajob', 'monster.com', 'careerbuilder', 'jooble', 'talent.com', 
+    'upwork', 'fiverr', 'salary.com', 'lensa', 'postjobfree',
+
+    # --- Government & Official ---
+    '.gov', 'texas.gov', 'dot.state', 'fmcsa', 'osha.gov', 'usps.com', 
+    'police', 'sheriff', 'cityof', 'countyof',
+
+    # --- Directories & Aggregators ---
+    'yelp', 'yellowpages', 'bbb.org', 'mapquest', 'angieslist', 
+    'thumbtack', 'nextdoor', 'porch', 'cargurus', 'mechanicadvisor', 
+    'repairpal', '4roadservice', 'findtruckservice', 'truckdown', 
+    'nttrdirectory', 'truckerguideapp', 'chamberofcommerce', 
+    'carfax', 'kbb.com', 'edmunds', 'autotrader', 'superpages', 
+    'dexknows', 'whitepages', 'trustpilot', 'groupon', 'local.yahoo',
+
+    # --- Social Media & Big Tech ---
+    'facebook', 'instagram', 'tiktok', 'youtube', 'twitter', 'pinterest', 
+    'wikipedia', 'reddit', 'medium', 'google', 'apple', 'amazon',
+
+    # --- National Fleet / Rental / Corporate ---
+    'uhaul', 'penske', 'budgettruck', 'ryder', 'enterprise', 
+    'loves.com', 'pilotflyingj', 'ta-petro', 'flyj', 'hertz', 
+    'goodyear', 'firestone', 'pepboys', 'autozone', 'oreillyauto', 
+    'advanceautoparts', 'napaonline', 'discounttire', 'michelinman', 
+    'safelite', 'aamco', 'meineke', 'jiffylube', 'valvoline', 
+    'ford.com', 'chevrolet.com', 'toyota.com', 'honda.com', 'dodge.com'
 ]
 
 # Global data list to store results
@@ -134,10 +159,14 @@ def clean_and_deduplicate(raw_data):
     df['Normalized_URL'] = df['URL'].apply(normalize_url)
     
     def is_directory(url):
-        return any(domain in url.lower() for domain in DIRECTORY_DOMAINS)
+        url_lower = url.lower()
+        if any(domain in url_lower for domain in DIRECTORY_DOMAINS):
+            return True
+        if url_lower.endswith('.pdf'):
+            return True
+        return False
 
     df['Is_Directory'] = df['Normalized_URL'].apply(is_directory)
-    # Keep only non-directory sites
     df = df[df['Is_Directory'] == False].drop(columns=['Is_Directory'])
     
     # Deduplicate: Keep the row with the BEST (lowest) Rank
@@ -191,7 +220,16 @@ def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -
         
         except RequestException as e:
             error_class_name = e.__class__.__name__
-            print(f"-> Error on {url} (Attempt {attempt + 1}/{max_retries}): {error_class_name}. Retrying...")
+            
+            # If the server explicitly blocked us (403/406), it's not a lead we can audit.
+            if response is not None and response.status_code in [403, 406, 429, 503]:
+                print(f"-> Blocked by firewall ({response.status_code}) on {url}")
+                audit_data['H1_Audit_Result'] = "Error: Bot Blocked" 
+                audit_data['Error_Status'] = "Blocked"
+                return audit_data
+                
+            # Real connection errors (DNS failure, Connection Refused) are actual leads
+            print(f"-> Error on {url} (Attempt {attempt + 1}/{max_retries}): {error_class_name}")
             
             if attempt == max_retries - 1:
                 audit_data['H1_Audit_Result'] = f"Error: Request Failed ({error_class_name})"
@@ -230,29 +268,45 @@ def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -
             else:
                 audit_data['Meta_Desc_Status'] = "Fail: Missing Meta Description"
             
-            # --- H1 Check (Keyword Relevance) ---
+            # --- H1 Check (Token-based Matching) ---
             h1_tag = soup.find('h1')
             if h1_tag:
                 h1_text = h1_tag.get_text(strip=True)
                 if h1_text:
-                    # Check if the keyword or city is mentioned (Case insensitive)
-                    if keyword.lower() in h1_text.lower() or city.lower() in h1_text.lower():
+                    # Break keyword and city into sets of words
+                    required_words = set(keyword.lower().split() + city.lower().split())
+                    # Remove common stop words to reduce noise (tx and Texas are added for this case)
+                    stop_words = {'in', 'near', 'the', 'and', 'me', 'us', 'tx', 'texas'}
+                    required_words = required_words - stop_words
+                    
+                    found_words = set(h1_text.lower().split())
+                    
+                    # Calculate intersection
+                    matches = required_words.intersection(found_words)
+                    match_percentage = len(matches) / len(required_words) if required_words else 0
+                    
+                    # If 50% or more of the keywords are found, consider it a Pass
+                    if match_percentage >= 0.5:
                         audit_data['H1_Audit_Result'] = f"Pass: {h1_text[:50]}..."
                     else:
                         audit_data['H1_Audit_Result'] = f"Fail: Irrelevant H1 ({h1_text[:30]}...)"
-                # If H1 tag exists but is empty, it remains 'Fail: H1 Missing or Empty' from initialization
-            
+
             # --- NAP Check (Extraction + Status) ---
             # Looks for phone number OR common address markers (St, Rd, Ave, Zip Code)
             phone_regex = r"(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})"
             nap_regex = phone_regex + r"|(\b\d{5}(?:-\d{4})?\b)|(\b(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Suite|Unit)\b)"
-            
             search_text = soup.body.get_text() if soup.body else soup.get_text()
+
+            # 1. Look for clickable tel links (Gold Standard)
+            tel_link = soup.select_one('a[href^="tel:"]')
             
-            # 1. NAP Status Check
+            if tel_link:
+                audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found'
+                audit_data['Phone_Number'] = tel_link.get('href').replace('tel:', '').strip()
+            
+            # 2. If no link, fallback to Regex on body text
             if re.search(nap_regex, search_text, re.IGNORECASE):
                 audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found'
-                # 2. NAP Data Extraction
                 phone_match = re.search(phone_regex, search_text)
                 if phone_match:
                     audit_data['Phone_Number'] = phone_match.group(0).strip()
@@ -370,98 +424,110 @@ def _get_rating_score(rating, reviews) -> str:
     
 def generate_sales_pitch(row):
     """
-    Generates a personalized, concise sales pitch based on audit failures
-    AND the *Competitive* GBP performance for the target query.
+    Generates a personalized, narrative-style sales pitch based on:
+    1. Critical Errors (NOINDEX, Server Down)
+    2. The 'Gap' between their GBP Reputation and Website Technicals.
+    3. Specific missing SEO elements (H1, NAP).
     """
-    pitch_points = []
     
-    # --- AUDIT DATA ---
-    h1_status = row['H1_Audit_Result']
-    nap_status = row['NAP_Audit_Result']
-    robots_status = row.get('Robots_Status', 'Pass: Index/Follow')
-    error_status = row.get('Error_Status')
+    # --- 1. Extraction & Setup ---
+    h1_status = row.get('H1_Audit_Result', '')
+    nap_status = row.get('NAP_Audit_Result', '')
+    robots_status = row.get('Robots_Status', 'Pass')
+    error_status = row.get('Error_Status', 'Success')
+    company_name = row.get('Company_Name', 'your business')
+    city = row.get('City', 'your area')
     
-    # --- COMPETITIVE GBP ANALYSIS ---
-    # These represent the top-ranked Local Map Pack business for the query
+    # Clean up company name for the email (remove Inc, LLC, etc for casual tone)
+    if company_name and company_name != 'N/A':
+        company_name = re.sub(r',?\s?(LLC|Inc|Corp|Ltd)\.?$', '', company_name, flags=re.IGNORECASE).strip()
+    else:
+        company_name = "your business"
+
+    # GBP Data
     gbp_rating = row.get('GBP_Rating', 0.0)
     gbp_reviews = row.get('GBP_Review_Count', 0)
-    gbp_score = _get_rating_score(gbp_rating, gbp_reviews)
     
-    # --- Intro Statement based on audit quality ---
-    intro_statement = "Based on an **AI-powered analysis** of your site and local market, we found the following actionable gap(s): "
+    # GBP Strength
+    is_gbp_strong = gbp_rating >= 4.0 and gbp_reviews >= 10
+    is_gbp_missing = gbp_rating == 0 or gbp_reviews == 0
 
-    # --- 1. CRITICAL FAILURES (Non-Negotiable Fixes) ---
+    # --- 2. Filter Blocked Sites ---
+    if error_status == 'Blocked': 
+        return "SKIP" 
+
+    # --- 3. Critical Technical Issues (The "Emergency" Pitch) ---
     
-    # Handle connection/parsing failures immediately (Stops further checks)
-    if error_status != 'Success' and error_status is not None:
+    # A. NOINDEX Tag (Site is telling Google to go away)
+    if "NOINDEX" in robots_status:
         return (
-            f"Your website returned an error ({error_status.split('(')[0].strip()}) when we tried to audit it. This suggests a potential **server or site health issue** that needs immediate attention."
+            "CRITICAL ISSUE: Your website has a 'NOINDEX' tag hidden in the code. "
+            "This explicitly tells Google NOT to show your site in search results. "
+            "We can fix this immediately to restore your visibility."
+        )
+    
+    # B. Genuine Server Errors (Not blocks)
+    if error_status and "Error" in error_status:
+         return (
+            f"When we tried to audit your site, it returned a server error ({error_status}). "
+            "This likely means potential customers can't access your site either. "
+            "We can help diagnose and stabilize your site health so you stop losing traffic."
         )
 
-    # Handle NOINDEX immediately (Most critical SEO failure)
-    if robots_status.startswith("Fail: NOINDEX"):
-        pitch_points.append(
-            "Critical Issue: Your homepage has a **'NOINDEX' tag**, meaning Google is blocked from showing you in search results! This is the most urgent fix."
-        )
-        return intro_statement + " | ".join(pitch_points)
-        
-    # --- 2. MAIN SEO GAPS (Keyword & Local Authority) ---
+    # --- 4. Scenario-Based Narrative Pitches ---
     
-    # Check H1 relevance
+    # Scenario A: The "Hidden Gem" (Strong Reputation, Weak Website)
+    # *Best Lead*: They have a real business (reviews) but a bad site.
+    if is_gbp_strong and ("Fail" in h1_status or "Fail" in nap_status):
+        missing_item = "main headline" if "Fail" in h1_status else "contact info"
+        return (
+            f"I noticed {company_name} has a great reputation on Google Maps ({gbp_rating} stars), "
+            f"but your website isn't doing you justice. Our audit found it's missing a clear {missing_item} "
+            "that Google uses to rank you. We can fix these technical gaps to align your website with your real-world reputation."
+        )
+
+    # Scenario B: The "Ghost" (No Map Presence + Weak Site)
+    # *Opportunity*: They are invisible. Pitch visibility.
+    if is_gbp_missing and ("Fail" in h1_status):
+        return (
+            f"I couldn't find {company_name} in the local Map Pack for '{city}', "
+            "and your website is missing the key H1 tags that help you rank there. "
+            "Currently, you are invisible to customers searching online. We can help you build your local presence from scratch."
+        )
+
+    # Scenario C: Specific H1 Relevance Failure
+    # They have an H1, but it says "Home" or "Welcome" instead of "Diesel Mechanic".
     if "Irrelevant" in h1_status:
-        pitch_points.append(
-            "Your main headline (**H1**) doesn't mention your core service or city. Google relies on this to rank you. Fixing this is the **fastest way to improve visibility**."
+        return (
+            "Your website's main headline doesn't tell Google exactly what you do (it misses your core keywords). "
+            "This is the #1 reason local businesses fail to rank organically. "
+            "We can tweak your content to target high-intent customers immediately."
         )
-    elif "Missing" in h1_status:
-        pitch_points.append(
-            "Missing a crucial **H1 heading** on your homepage! Search engines rely on this to know what you do. This is the **fastest way to improve your visibility**."
+    
+    # Scenario D: H1 Completely Missing
+    if "Missing" in h1_status:
+        return (
+            "Your homepage is missing a main 'H1' heading. "
+            "Search engines rely on this specific tag to understand your services. "
+            "Adding this is the fastest, lowest-cost way to improve your visibility."
         )
 
-    # Check NAP
-    if nap_status.startswith("Fail"):
-        pitch_points.append(
-            "Can't find your phone number or address quickly. This hurts user trust and is a **critical fix for local SEO rankings** (the 'Map Pack')."
+    # Scenario E: NAP Failure (Trust & Local SEO)
+    if "Fail" in nap_status:
+        return (
+            "We couldn't easily find your phone number or address on your homepage. "
+            "If we can't find it, neither can Google's local bot, which hurts your Map rankings significantly. "
+            "This is a quick fix that boosts trust and calls."
         )
-        
-    # --- 3. GBP-ENHANCED PITCHES (Using Competitor Context) ---
-    
-    seo_gaps_exist = any("H1" in p or "NAP" in p for p in pitch_points)
-    
-    if seo_gaps_exist and gbp_score == "Strong":
-        # Strategy: Your competitor is winning on reputation, you must win on website.
-        pitch_points.append(
-            f"Your top competitor has a **strong GBP reputation ({gbp_rating} stars from {gbp_reviews} reviews)**. Your site's fundamental gaps (H1/NAP) are holding you back from competing with them and converting the customers who find you. We can fix your site today."
-        )
-    elif gbp_score == "Missing":
-        # Strategy: The local map pack is weak/missing. Huge, open opportunity.
-        pitch_points.append(
-            "The **local Map Pack is under-optimized** for your query (no strong competitor is showing). By fixing your website AND quickly establishing a strong review profile, you could easily dominate the Map Pack."
-        )
-    
-    # --- 4. SECONDARY GAPS (If primary pitch points are empty) ---
-    
-    if not pitch_points: # Only append if no major gaps or GBP context were added above
-        if row['Title_Status'].startswith("Fail"):
-            pitch_points.append(f"Your title tag is {row['Title_Status'].split(':')[1].strip().lower()}. This is your first impression to Google and potential customers.")
-        
-        if row['Meta_Desc_Status'].startswith("Fail: Missing"):
-            pitch_points.append("You are missing a crucial Meta Description, leaving Google to write its own (often poor) one for your search results.")
 
-        schema_status = row['Schema_Issue']
-        if schema_status.startswith("Fail"):
-            pitch_points.append(
-                "You are missing Structured Data (Schema Markup). Adding 'LocalBusiness' schema is essential for Google to understand your services and is a huge factor for Map visibility."
-            )
-            
-    # --- FINAL RETURN ---
-    if pitch_points:
-        # Deduplicate the pitch points if any were double-added (e.g., NAP in section 2 & 3)
-        # Using a set to ensure unique messages
-        unique_pitches = list(dict.fromkeys(pitch_points)) 
-        return intro_statement + " | ".join(unique_pitches)
-    else:
-        return intro_statement + "None! Your site is strong. We specialize in advanced strategies (authority building, conversion rate optimization) to take you from rank #10 to rank #1."
-    
+    # --- 5. The "Growth" Pitch (No Errors Found) ---
+    # If the site passes all technical checks, pitch Authority/Backlinks instead.
+    return (
+        "Your website's technical foundation looks solid. "
+        "However, to move from page 2 to page 1, you likely need an Authority strategy (Backlinks & Content) rather than technical fixes. "
+        "We specialize in taking established sites like yours to the top spot."
+    )
+
 def create_final_report(df):
     """
     Applies the sales pitch logic, cleans up columns, and exports the final report
@@ -474,12 +540,15 @@ def create_final_report(df):
         print("Report not generated: No unique prospects found.")
         return
         
-    # 1. Generate the Sales Pitch (if not already done)
+    # Generate the Sales Pitch
     if 'Sales_Pitch' not in df.columns:
         print("-> Generating sales pitches...")
         df['Sales_Pitch'] = df.apply(generate_sales_pitch, axis=1)
+
+    # Remove rows where the pitch is "SKIP" (Blocked sites)
+    df = df[df['Sales_Pitch'] != "SKIP"]
     
-    # 2. Add an 'Actionable' filter column
+    # Add an 'Actionable' filter column
     df['Actionable_Target'] = df['Sales_Pitch'].apply(lambda x: 'YES' if 'Fail' in x or 'Error' in x or 'Critical' in x else 'NO')
 
     # --- CSV EXPORT FOR INSTANTLY.AI (Simplified Structure) ---
