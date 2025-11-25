@@ -1,80 +1,113 @@
-# SEO Prospecting Agent — New Generation Tool
+# Smart SEO Prospecting Agent 🤖
 
 ## Overview
-The SEO Prospecting Agent is a Python script that finds highly qualified local leads for SEO outreach. It targets businesses ranking beyond Page 1 (typically Google Page 2–5) that have basic on‑page SEO issues and generates an actionable sales pitch for outreach.
+The **Smart SEO Prospecting Agent** is an advanced Python tool designed to automate the discovery of high-value local SEO leads. Unlike standard scrapers, this agent performs a **"Gap Analysis"**: it compares a prospect's real-world reputation (Google Business Profile ratings) against their website's technical health to identify the most "winnable" clients.
 
-## Features
-- Targeted SERP extraction using SerpApi (geo‑specific, keyword‑driven)
-- Focus on Page 2+ results to find less competitive opportunities
-- Deduplication and filtering (keeps best unique URLs, excludes directories like Yelp/Facebook)
-- On‑page audits for:
-    - Missing or empty H1 tag
-    - Missing or unclear NAP (detected mainly via phone number)
-- Retry mechanism (three attempts for web requests)
-- Actionable reporting: final CSV with a personalized `Sales_Pitch` column
+It targets businesses typically ranking on Google Pages 2–5, audits them for critical SEO failures, and generates **human-like, narrative sales pitches** ready for cold outreach.
+
+## 🚀 Key Features
+
+### 🧠 Intelligent Filtering & Auditing
+*   **Smart Directory Exclusion:** Automatically filters out noise like Indeed, Glassdoor, Gov sites, and huge national brands (Penske, Ford) to focus on local SMBs.
+*   **Fuzzy Logic Matching:** Uses token-based matching for H1 tags. It won't fail a site just because the H1 is "Best Diesel Repair" instead of the exact keyword "Diesel Repair."
+*   **Robust NAP Detection:** Detects phone numbers via regex and modern `href="tel:"` link analysis.
+*   **Anti-Bot Handling:** Intelligently detects firewalls (403 Forbidden). It **SKIPS** these sites rather than marking them as "Broken," preventing embarrassing outreach errors.
+
+### 📊 GBP & Gap Analysis
+*   **Competitive Context:** The agent fetches **Google Business Profile (GBP)** data (Ratings & Review Counts) for every prospect.
+*   **The "Gap" Strategy:**
+    *   **Scenario A (Gold Mine):** Strong GBP Reputation + Weak Website = Pitch focuses on "Your site isn't doing your reputation justice."
+    *   **Scenario B (Ghost):** No GBP Presence + Weak Website = Pitch focuses on "You are invisible to local customers."
+
+### 📧 Actionable Output
+*   **Human-Like Pitches:** No more robotic error lists (`Fail: H1`). The agent generates full sentences like: *"I noticed you have a great reputation on Maps (4.8 stars), but your website is missing the key tags needed to rank organically."*
+*   **Dual Export:**
+    1.  `Instantly_Import_Actionable_*.csv`: Cleaned, formatted file ready to upload directly to cold email tools (Instantly.ai, Lemlist).
+    2.  `SEO_Detailed_Audit_*.xlsx`: A comprehensive Excel report with full audit data for human review.
 
 ## Prerequisites
-- Python 3.12 (preferred)
-- SerpApi account and API key
+*   Python 3.10+
+*   SerpApi Account & API Key
 
-## Required libraries
-Install dependencies:
-```bash
-pip install pandas serpapi requests beautifulsoup4 python-dotenv
-```
+## Installation
 
-## Setup
+1.  **Clone the repository:**
+    ```bash
+    git clone <repository-url>
+    cd <repository-folder>
+    ```
 
-1. Create a `.env` file in the project root:
-```env
-SERPAPI_API_KEY="YOUR_SERPAPI_KEY_HERE"
-```
+2.  **Install dependencies:**
+    ```bash
+    pip install pandas serpapi requests beautifulsoup4 python-dotenv openpyxl
+    ```
 
-2. Create `serp_config.py` to define targets:
-```python
-# serp_config.py
-CITIES = [
+3.  **Environment Setup:**
+    Create a `.env` file in the project root:
+    ```env
+    SERPAPI_API_KEY="YOUR_SERPAPI_KEY_HERE"
+    ```
+
+4.  **Target Configuration:**
+    Create or edit `serp_config.py` to define your niche:
+    ```python
+    # serp_config.py
+    CITIES = [
         "Austin",
         "Dallas",
         "Houston",
-]
+    ]
 
-KEYWORDS = [
+    KEYWORDS = [
         "fleet maintenance service",
         "heavy duty truck repair",
-        "diesel alignment shop",
-]
-```
+        "mobile diesel mechanic",
+    ]
+    ```
 
-## How to run
-The script accepts command-line arguments for the start and end page numbers.
+## Usage
 
-Syntax:
+The script accepts command-line arguments for the Google Search **Page Range**.
+
+**Syntax:**
 ```bash
-python agent.py <START_PAGE_NUMBER> <END_PAGE_NUMBER>
+python Agent.py <START_PAGE> <END_PAGE>
 ```
 
-Example — scrape results from Page 2 (rank 11) to Page 5 (rank 50):
+**Example:**
+To scrape results from Page 2 (Rank 11) to Page 5 (Rank 50):
 ```bash
-python agent.py 2 5
+python Agent.py 2 5
 ```
 
-## Output
-- CSV report containing audits and a `Sales_Pitch` column ready for outreach.
+## How It Works (The Logic Flow)
 
-## Refinements and Enhancements (serp_config optimization)
-Refining keywords improves lead quality. Examples:
+1.  **Scrape:** Fetches organic results from Google using SerpApi.
+2.  **Clean:** Removes directories (Yelp, Indeed), government sites, and PDFs.
+3.  **Enrich:** Fetches the Top Competitor's GBP stats for that specific keyword/city.
+4.  **Audit:** Visits every unique prospect URL to check:
+    *   Server Status (Is it down or just blocked?)
+    *   H1 Tags (Contextual relevance)
+    *   NAP (Name, Address, Phone) visibility
+    *   Meta Tags & Schema
+5.  **Analyze:** Compares the Audit vs. GBP Data.
+6.  **Pitch:** Generates a unique "Final_Pitch" string.
+7.  **Export:** Saves the actionable leads to CSV and the full data to XLSX.
 
-- High intent — targets users seeking specific fixes:
-    - Why: captures customers with immediate need
-    - Examples: `emergency roadside tire change`, `mobile diesel repair near me`
+## Output Files
 
-- Service‑page only — targets businesses that should have dedicated service pages:
-    - Why: easier to audit page content and pricing
-    - Examples: `[Service] + pricing`, `[Service] + cost`, `[Service] + quote`
+*   **`Instantly_Import_Actionable_YYYYMMDD.csv`**:
+    *   Contains only leads marked `Actionable_Target: YES`.
+    *   Columns: `Prospect_Name`, `Website_URL`, `Final_Pitch`, `City`, `Keyword`, etc.
+    *   *Ready for import into cold email campaigns.*
 
-- Exclusion thinking — mentally avoid keywords dominated by national brands if you want more local opportunities (no code change required).
+*   **`SEO_Detailed_Audit_YYYYMMDD.xlsx`**:
+    *   Contains ALL audited sites (including passed audits).
+    *   Includes technical details: H1 content, Meta descriptions, specific error codes, and GBP stats.
+    *   *Used for manual review or data analysis.*
 
-Use these refinements in `KEYWORDS` to get cleaner, higher‑intent results.
-
-- On-page audit strategy — maybe fine tuning the audit strategy could generate higher quality leads
+## Optimization Tips
+To get the best results, use **high-intent keywords** in your `serp_config.py`:
+*   ❌ *Avoid:* "Trucks" (Too broad, national brands dominate).
+*   ✅ *Use:* "Mobile semi truck repair near me" (High urgency, local intent).
+*   ✅ *Use:* "Fleet maintenance pricing [City]" (Commercial intent).
