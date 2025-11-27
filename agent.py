@@ -9,10 +9,20 @@ import time
 import random
 import re
 import argparse
+import json
+from urllib.parse import urljoin, urlparse
+import google.generativeai as genai
 from requests.exceptions import RequestException
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Initialize Gemini Client
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("[WARNING] GEMINI_API_KEY not found in .env")
 
 # List of common User-Agents to rotate (Prevents 403 Forbidden errors)
 USER_AGENTS = [
@@ -54,6 +64,11 @@ DIRECTORY_DOMAINS = [
     'safelite', 'aamco', 'meineke', 'jiffylube', 'valvoline', 
     'ford.com', 'chevrolet.com', 'toyota.com', 'honda.com', 'dodge.com'
 ]
+
+# Filter out "emails" that are actually file names or system addresses
+JUNK_EMAIL_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.js', '.css', '.woff', '.ttf']
+JUNK_EMAIL_PREFIXES = ['sentry', 'noreply', 'no-reply', 'hostmaster', 'postmaster', 'webmaster', 'example']
+JUNK_EMAIL_DOMAINS = ['wix.com', 'godaddy.com', 'squarespace.com', 'sentry.io', 'wordpress.com', 'google.com', 'yandex.ru', 'example.com']
 
 # Global data list to store results
 results_data = []
@@ -177,10 +192,190 @@ def clean_and_deduplicate(raw_data):
     
     return df_cleaned
 
-def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -> dict: # Increased retries
+def extract_emails_from_html(soup):
     """
-    Performs quick, non-intrusive SEO checks on a given URL.
-    Uses User-Agent rotation and retries.
+    Robust extraction: Checks mailto, visible text, and raw HTML.
+    Prioritizes business emails over generic ones.
+    """
+    emails = set()
+    
+    # 1. Check 'mailto:' links (High Confidence)
+    for link in soup.select('a[href^="mailto:"]'):
+        email = link.get('href').replace('mailto:', '').split('?')[0].strip()
+        if email and '@' in email:
+            emails.add(email.lower())
+
+    # 2. Regex Search in Text AND Raw HTML (Catch hidden emails)
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    
+    # A. Visible Text
+    text_content = soup.get_text(" ", strip=True) 
+    found_text = re.findall(email_pattern, text_content)
+    emails.update([e.lower() for e in found_text])
+    
+    # B. Raw HTML (catches values inside input fields or scripts)
+    raw_html = str(soup)
+    found_raw = re.findall(email_pattern, raw_html)
+    emails.update([e.lower() for e in found_raw])
+
+    # 3. Filtering & Prioritization
+    valid_emails = []
+    
+    for email in emails:
+        # Filter Junk Extensions
+        if any(email.endswith(ext) for ext in JUNK_EMAIL_EXTENSIONS):
+            continue
+            
+        local_part, domain_part = email.split('@')
+        
+        # Filter Junk Prefixes
+        if local_part in JUNK_EMAIL_PREFIXES:
+            continue
+            
+        # Filter Junk Domains
+        if domain_part in JUNK_EMAIL_DOMAINS:
+            continue
+            
+        valid_emails.append(email)
+
+    if not valid_emails:
+        return []
+
+    # 4. Sorting: Prioritize 'info', 'contact', 'sales', 'office'
+    priority_prefixes = ['info', 'contact', 'sales', 'office', 'admin', 'hello', 'service']
+    
+    def sort_score(e):
+        prefix = e.split('@')[0]
+        if prefix in priority_prefixes:
+            return 0 # High priority
+        return 1 # Low priority
+        
+    valid_emails.sort(key=sort_score)
+    
+    # Debug Print (See what is happening!)
+    print(f"   [DEBUG] Emails Found: {valid_emails}")
+    
+    return valid_emails
+
+def find_best_contact_url(soup, base_url):
+    """
+    Scans all links, scores them based on heuristics.
+    """
+    candidates = []
+    high_priority_keywords = ['contact', 'contact-us', 'contact_us', 'contactus', 'reach-us', 'get-in-touch']
+    fallback_keywords = ['about', 'about-us', 'about_us']
+    
+    base_netloc = urlparse(base_url).netloc.replace('www.', '')
+    
+    for a in soup.find_all('a', href=True):
+        href = a['href'].strip()
+        text = a.get_text(" ", strip=True).lower()
+        
+        if href.startswith(('#', 'javascript:', 'mailto:', 'tel:')) or not href:
+            continue
+            
+        full_url = urljoin(base_url, href)
+        parsed_url = urlparse(full_url)
+        link_netloc = parsed_url.netloc.replace('www.', '')
+
+        if parsed_url.netloc != "" and base_netloc not in link_netloc:
+             continue
+
+        path = parsed_url.path.lower()
+        score = 0
+        
+        # A. URL Path Matches
+        if any(kw in path for kw in high_priority_keywords):
+            score += 100
+            
+        # B. Link Text Matches
+        if 'contact' in text:
+            score += 50
+            if len(text) < 20: score += 20
+                
+        # C. Navigation/Footer Context
+        parent_tags = [parent.name for parent in a.parents]
+        if 'nav' in parent_tags or 'footer' in parent_tags or 'header' in parent_tags:
+            score += 10
+            
+        # D. Fallback: About Pages
+        if any(kw in path for kw in fallback_keywords):
+            score += 30
+        elif 'about' in text and len(text) < 15:
+            score += 20
+
+        if score > 0:
+            candidates.append((score, full_url))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    
+    return None
+
+def generate_ai_campaign(row):
+    """
+    Uses Google Gemini (2.5 Flash) to generate a 3-email sequence.
+    Returns a dictionary with Email_1, Email_2, and Email_3.
+    """
+    # 1. Prepare Data
+    company = row.get('Company_Name', 'Business Owner')
+    city = row.get('City', 'your city')
+    gbp_rating = row.get('GBP_Rating', 0)
+    h1_status = row.get('H1_Audit_Result', 'Unknown')
+    nap_status = row.get('NAP_Audit_Result', 'Unknown')
+    
+    # 2. Define the Prompt
+    prompt = f"""
+    You are a top-tier SEO Sales Copywriter for an agency called "MapWinners". 
+    Your goal is to write a 3-email cold outreach sequence for a local business.
+    
+    PROSPECT DETAILS:
+    - Business: {company} in {city}
+    - Google Maps Rating: {gbp_rating} stars.
+    - Audit Issues: Main Heading (H1): "{h1_status}", Contact Info (NAP): "{nap_status}".
+    
+    STRATEGY:
+    1. Email 1 (The Hook): 
+        - If Audit Issues are "Fail": Warn that technical errors are hurting their rankings.
+        - If Audit Issues are "Pass": Praise their foundation but warn that they need "Authority/Backlinks" to hit #1.
+    2. Email 2 (Value - 3 Days Later): Explain WHY the specific error found (H1 or NAP) kills rankings.
+    3. Email 3 (Breakup - 7 Days Later): Gentle reminder.
+    
+    TONE: Professional, concise, high-value. No fluff.
+    
+    OUTPUT FORMAT:
+    You must output a JSON object with these exact keys:
+    {{
+        "subject_1": "...", "body_1": "...",
+        "subject_2": "...", "body_2": "...",
+        "subject_3": "...", "body_3": "..."
+    }}
+    """
+
+    try:
+        # 3. Call Gemini API
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        
+        return json.loads(response.text)
+
+    except Exception as e:
+        print(f"-> Gemini Error: {e}")
+        return {
+            "subject_1": "Error generating", "body_1": "Error",
+            "subject_2": "Error generating", "body_2": "Error",
+            "subject_3": "Error generating", "body_3": "Error"
+        }
+
+def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -> dict: 
+    """
+    Performs SEO checks AND extracts Email/NAP.
+    Includes logic to hop to the Contact page if email is missing.
     """
     # --- AUDIT DATA INITIALIZATION ---
     audit_data = {
@@ -191,65 +386,54 @@ def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -
         'Schema_Issue': 'Fail: No LocalBusiness Schema Found',
         'Robots_Status': 'Pass: Index/Follow',
         'Phone_Number': 'N/A',
+        'Email_Address': 'N/A',
         'Company_Name': 'N/A' ,
         'Error_Status': 'Success'
     }
     
     response = None
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
 
+    # --- 1. REQUEST LANDING PAGE ---
     for attempt in range(max_retries):
         try:
-            # --- ROTATE USER AGENT & SLOWER RETRY SLEEP ---
-            headers = {
-                'User-Agent': random.choice(USER_AGENTS),
-                'Accept-Language': 'en-US,en;q=0.9'
-            }
-            
-            # Use longer, randomized sleep before retries
             if attempt > 0:
-                # Slower, randomized sleep for HTTP retries
                 sleep_time = random.uniform(3, 5) 
-                print(f"-> Retrying in {sleep_time:.1f}s...")
+                print(f"   -> Retrying in {sleep_time:.1f}s...")
                 time.sleep(sleep_time)
 
             response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status() 
             
-            # If we get here, the request was successful (200 OK)
-            break
-        
-        except RequestException as e:
-            error_class_name = e.__class__.__name__
-            
-            # If the server explicitly blocked us (403/406), it's not a lead we can audit.
-            if response is not None and response.status_code in [403, 406, 429, 503]:
-                print(f"-> Blocked by firewall ({response.status_code}) on {url}")
+            # Check for blocking status codes
+            if response.status_code in [403, 406, 429, 503]:
+                print(f"   -> Blocked by firewall ({response.status_code}) on {url}")
                 audit_data['H1_Audit_Result'] = "Error: Bot Blocked" 
                 audit_data['Error_Status'] = "Blocked"
                 return audit_data
-                
-            # Real connection errors (DNS failure, Connection Refused) are actual leads
-            print(f"-> Error on {url} (Attempt {attempt + 1}/{max_retries}): {error_class_name}")
             
+            response.raise_for_status() 
+            break
+        
+        except RequestException as e:
             if attempt == max_retries - 1:
-                audit_data['H1_Audit_Result'] = f"Error: Request Failed ({error_class_name})"
-                audit_data['Error_Status'] = f"Error: {error_class_name}"
+                audit_data['Error_Status'] = f"Error: {e.__class__.__name__}"
+                audit_data['H1_Audit_Result'] = f"Error: Request Failed ({e.__class__.__name__})"
                 return audit_data
-            
-    # --- PARSING LOGIC (Only runs if request succeeded) ---
+
+    # --- 2. PARSE LANDING PAGE ---
     try:
         if response and response.content:
-            # Explicitly check for content to avoid errors on empty responses
             soup = BeautifulSoup(response.content, 'html.parser')
             
             # --- Company Name Extraction ---
             if soup.title and soup.title.string:
                 title_text = soup.title.string.strip()
-                # Use a robust split based on common separators
                 company_name_part = re.split(r'[-|:-]', title_text)[0].strip()
                 audit_data['Company_Name'] = company_name_part or 'N/A'
                 
-                # --- Title Check ---
                 if len(title_text) < 10 or "Home" in title_text or "Default" in title_text:
                     audit_data['Title_Status'] = "Fail: Weak/Default Title Tag"
                 else:
@@ -268,57 +452,26 @@ def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -
             else:
                 audit_data['Meta_Desc_Status'] = "Fail: Missing Meta Description"
             
-            # --- H1 Check (Token-based Matching) ---
+            # --- H1 Check (Fuzzy/Token-based Matching) ---
             h1_tag = soup.find('h1')
             if h1_tag:
                 h1_text = h1_tag.get_text(strip=True)
                 if h1_text:
-                    # Break keyword and city into sets of words
                     required_words = set(keyword.lower().split() + city.lower().split())
-                    # Remove common stop words to reduce noise (tx and Texas are added for this case)
                     stop_words = {'in', 'near', 'the', 'and', 'me', 'us', 'tx', 'texas'}
                     required_words = required_words - stop_words
-                    
                     found_words = set(h1_text.lower().split())
-                    
-                    # Calculate intersection
                     matches = required_words.intersection(found_words)
                     match_percentage = len(matches) / len(required_words) if required_words else 0
                     
-                    # If 50% or more of the keywords are found, consider it a Pass
                     if match_percentage >= 0.5:
                         audit_data['H1_Audit_Result'] = f"Pass: {h1_text[:50]}..."
                     else:
                         audit_data['H1_Audit_Result'] = f"Fail: Irrelevant H1 ({h1_text[:30]}...)"
-
-            # --- NAP Check (Extraction + Status) ---
-            # Looks for phone number OR common address markers (St, Rd, Ave, Zip Code)
-            phone_regex = r"(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})"
-            nap_regex = phone_regex + r"|(\b\d{5}(?:-\d{4})?\b)|(\b(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Suite|Unit)\b)"
-            search_text = soup.body.get_text() if soup.body else soup.get_text()
-
-            # 1. Look for clickable tel links (Gold Standard)
-            tel_link = soup.select_one('a[href^="tel:"]')
             
-            if tel_link:
-                audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found'
-                audit_data['Phone_Number'] = tel_link.get('href').replace('tel:', '').strip()
-            
-            # 2. If no link, fallback to Regex on body text
-            if re.search(nap_regex, search_text, re.IGNORECASE):
-                audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found'
-                phone_match = re.search(phone_regex, search_text)
-                if phone_match:
-                    audit_data['Phone_Number'] = phone_match.group(0).strip()
-            else:
-                footer = soup.find('footer')
-                if footer and re.search(nap_regex, footer.get_text(), re.IGNORECASE):
-                    audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found (in footer)'
-
             # --- Schema Markup Check ---
             schema_scripts = soup.find_all('script', type='application/ld+json')
             for script in schema_scripts:
-                # Use script.string to safely access content
                 if script.string and ('LocalBusiness' in script.string or 'Organization' in script.string):
                     audit_data['Schema_Issue'] = 'Pass: LocalBusiness/Organization Schema Found'
                     break
@@ -331,13 +484,55 @@ def run_on_page_audit(url: str, keyword: str, city: str, max_retries: int = 3) -
                     audit_data['Robots_Status'] = 'Fail: NOINDEX tag found'
                 elif 'nofollow' in content:
                     audit_data['Robots_Status'] = 'Fail: NOFOLLOW tag found'
+
+            # --- NAP & EMAIL EXTRACTION ---
             
+            # 1. Phone Number Logic
+            phone_regex = r"(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})"
+            tel_link = soup.select_one('a[href^="tel:"]')
+            
+            if tel_link:
+                audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found'
+                audit_data['Phone_Number'] = tel_link.get('href').replace('tel:', '').strip()
+            elif re.search(phone_regex, soup.get_text(), re.IGNORECASE):
+                audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found'
+                phone_match = re.search(phone_regex, soup.get_text())
+                if phone_match:
+                    audit_data['Phone_Number'] = phone_match.group(0).strip()
+            else:
+                 footer = soup.find('footer')
+                 if footer and re.search(phone_regex, footer.get_text(), re.IGNORECASE):
+                    audit_data['NAP_Audit_Result'] = 'Pass: Address/Phone Found (in footer)'
+
+            # 2. Email Extraction (Landing Page)
+            emails = extract_emails_from_html(soup)
+            
+            # 3. Contact Page Crawl (If Email Missing)
+            if not emails:
+                contact_url = find_best_contact_url(soup, url)
+                
+                if contact_url:
+                    if contact_url.rstrip('/') != url.rstrip('/'):
+                        print(f"-> Crawling Contact Page: {contact_url}")
+                        try:
+                            resp_contact = requests.get(contact_url, headers=headers, timeout=10)
+                            if resp_contact.status_code == 200:
+                                soup_contact = BeautifulSoup(resp_contact.content, 'html.parser')
+                                new_emails = extract_emails_from_html(soup_contact)
+                                if new_emails:
+                                    print(f"-> Found {len(new_emails)} email(s) on Contact page!")
+                                    emails = new_emails
+                        except Exception:
+                            pass
+
+            if emails:
+                audit_data['Email_Address'] = emails[0]
+                print(f"   + Email Secured: {emails[0]}")
+            else:
+                print(f"   - No Email Found")
             
     except Exception as e:
-        # Handle parsing failures gracefully
-        error_class_name = e.__class__.__name__
-        audit_data['H1_Audit_Result'] = f"Error: Parsing Failure ({error_class_name})"
-        audit_data['Error_Status'] = f"Error: Parsing Failure ({error_class_name})"
+        audit_data['Error_Status'] = f"Error: Parsing Failure ({e.__class__.__name__})"
     
     return audit_data
 
@@ -532,96 +727,128 @@ def is_actionable(row):
     """
     Determines if a prospect is actionable based on Data Columns.
     """
-    # 1. SKIP BLOCKED SITES (Firewalls, 403s)
+    # 1. MANDATORY: Check for Email
+    email = row.get('Email_Address')
+    if not email or email == 'N/A' or pd.isna(email):
+        return 'NO'
+    
+    # 2. SKIP BLOCKED SITES
     if row.get('Final_Pitch') == "SKIP":
         return 'NO'
-
-    # 2. YES: Critical Technical Errors (NOINDEX)
-    if "Fail" in row.get('Robots_Status', ''):
+        
+    # 3. YES: Critical Technical Errors
+    if "Fail" in str(row.get('Robots_Status', '')):
         return 'YES'
 
-    # 3. YES: Genuine Server Errors (Timeouts, SSL Errors)
-    error_status = row.get('Error_Status', '')
-    if error_status and "Error" in error_status and error_status != "Success":
+    # 4. YES: Genuine Server Errors
+    error_status = str(row.get('Error_Status', ''))
+    if "Error" in error_status and error_status != "Success":
         return 'YES'
 
-    # 4. YES: SEO Gaps (H1 or NAP)
-    h1_fail = "Fail" in row.get('H1_Audit_Result', '')
-    nap_fail = "Fail" in row.get('NAP_Audit_Result', '')
+    # 5. YES: SEO Gaps
+    h1_fail = "Fail" in str(row.get('H1_Audit_Result', ''))
+    nap_fail = "Fail" in str(row.get('NAP_Audit_Result', ''))
     
     if h1_fail or nap_fail:
         return 'YES'
 
-    # 5. NO: Everything else (Perfect sites)
-    return 'NO'
+    # 6. YES: Healthy Site (Authority Pitch)
+    return 'YES'
 
 def create_final_report(df):
-    """
-    Applies the sales pitch logic, cleans up columns, and exports the final report.
-    """
-    
     if df.empty:
         print("Report not generated: No unique prospects found.")
         return
-        
-    # 1. Generate the Sales Pitch
-    if 'Sales_Pitch' not in df.columns:
-        print("-> Generating sales pitches...")
-        df['Sales_Pitch'] = df.apply(generate_sales_pitch, axis=1)
+
+    # --- 1. PRE-CALCULATE ACTIONABILITY (Rule-Based) ---
+    print("-> Calculating initial actionability (Rule-based)...")
     
-    # 2. Filter out explicit "SKIP" rows and create a fresh copy
-    df = df[df['Sales_Pitch'] != "SKIP"].copy()
+    df['Final_Pitch'] = '' 
+    df['Actionable_Target'] = df.apply(is_actionable, axis=1)
 
-    if df.empty:
-        print("All prospects were filtered out (Blocked/Skipped). No report generated.")
-        return
+    # --- 2. FILTER FOR AI GENERATION ---
+    ai_candidates = df[
+        (df['Actionable_Target'] == 'YES') & 
+        (df['Email_Address'] != 'N/A') & 
+        (df['Email_Address'].notna())
+    ].copy()
+    
+    print(f"-> Identified {len(ai_candidates)} leads for Campaign generation...")
 
-    # 3. Rename/Map columns for the report
-    df['Final_Pitch'] = df['Sales_Pitch']
+    # --- 3. RUN GEMINI AI LOOP ---
+    email_data = []
+
+    for index, row in ai_candidates.iterrows():
+        print(f"-> Generating Campaign for: {row['Company_Name']}...")
+        
+        campaign = generate_ai_campaign(row)
+        
+        email_data.append({
+            'URL': row['URL'], # Key to merge back
+            'Subject_1': campaign.get('subject_1', ''),
+            'Body_1': campaign.get('body_1', ''),
+            'Subject_2': campaign.get('subject_2', ''),
+            'Body_2': campaign.get('body_2', ''),
+            'Subject_3': campaign.get('subject_3', ''),
+            'Body_3': campaign.get('body_3', '')
+        })
+        
+        time.sleep(7) 
+
+    # --- 4. MERGE AI DATA BACK ---
+    if email_data:
+        ai_df = pd.DataFrame(email_data)
+        df = df.merge(ai_df, on='URL', how='left')
+    else:
+        for col in ['Subject_1', 'Body_1', 'Subject_2', 'Body_2', 'Subject_3', 'Body_3']:
+            df[col] = ''
+
+    # --- 5. EXPORT FOR INSTANTLY ---
+    print("\n--- EXPORTING CSV ---")
+    
+    # Clean Prospect Name
+    df['Prospect_Name'] = df['Company_Name'].apply(lambda x: x if x and x != 'N/A' else 'Client')
     df['Website_URL'] = df['URL']
     df['Rank_Found'] = df['Rank']
 
-    # 4. Determine Actionability based on DATA, not Pitch Text
-    df['Actionable_Target'] = df.apply(is_actionable, axis=1)
-
-    # --- CSV EXPORT FOR INSTANTLY.AI (Simplified Structure) ---
-    print("\n--- EXPORTING INSTANTLY.AI CSV ---")
-    
-    # Create clean Prospect Name
-    df['Prospect_Name'] = df['Company_Name'].apply(lambda x: x if x and x != 'N/A' else 'Client')
-    
+    # Define Export Columns
     instantly_columns = [
-        'Actionable_Target',
         'Prospect_Name', 
+        'Email_Address', 
         'Website_URL',
-        'Final_Pitch',
-        'Keyword',
+        'Subject_1', 'Body_1',
+        'Subject_2', 'Body_2',
+        'Subject_3', 'Body_3',
         'City',
-        'Rank_Found',
-        'Phone_Number'
+        'Keyword'
     ]
     
-    # Filter only actionable targets for the cold email list
-    df_instantly = df[df['Actionable_Target'] == 'YES'][instantly_columns].copy()
+    # Filter only actionable targets that actually got emails
+    df_instantly = df[(df['Actionable_Target'] == 'YES') & (df['Subject_1'].notna()) & (df['Subject_1'] != '')][instantly_columns].copy()
     
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    csv_filename = f"Instantly_Import_Actionable_{timestamp}.csv"
+    csv_filename = f"MapWinners_Campaign_{timestamp}.csv"
     
     df_instantly.to_csv(csv_filename, index=False)
-    print(f"File: {csv_filename} (Ready for Instantly.ai/Outreach Import)")
+    print(f"File: {csv_filename} (Ready for Instantly.ai)")
 
-    # --- EXCEL EXPORT FOR HUMAN REVIEW (Detailed Audit Report) ---
-    print("\n--- EXPORTING DETAILED AUDIT XLSX ---")
+    # --- 6. EXPORT DETAILED AUDIT XLSX ---
+    print("\n--- EXPORTING XLSX ---")
 
     detailed_columns = [
         'Actionable_Target',
         'Rank',
         'Company_Name',
+        'Email_Address',
         'Keyword',
         'City',
         'URL',
-        'Title',
-        'Final_Pitch',
+        'Subject_1',
+        'Body_1',
+        'Subject_2',
+        'Body_2',
+        'Subject_3',
+        'Body_3',
         'H1_Audit_Result',
         'NAP_Audit_Result',
         'Phone_Number',
@@ -646,13 +873,9 @@ def create_final_report(df):
     xlsx_filename = f"SEO_Detailed_Audit_{timestamp}.xlsx"
     df_report_full.to_excel(xlsx_filename, index=False)
 
-    # --- FINAL SUMMARY ---
-    actionable_count = len(df_instantly)
-
     print(f"\n[SUCCESS] Final report created!")
     print(f"Human Readable File: {xlsx_filename}")
-    print(f"Total Unique Prospects Audited: {len(df_report_full)}")
-    print(f"Total Actionable Leads (Ready for Outreach): {actionable_count}")
+    print(f"Total Actionable Leads (Ready for Outreach): {len(df_instantly)}")
     print("The script is complete. Run finished.")
 
 if __name__ == '__main__':
@@ -732,8 +955,9 @@ if __name__ == '__main__':
         if not cleaned_df.empty:
             print("\nReady to begin On-Page Auditing of unique prospects.")
             
-            # Prepare lists for audit results (must match keys in run_on_page_audit)
-            audit_results_list = []
+            cleaned_df['Email_Address'] = 'N/A'
+            cleaned_df['H1_Audit_Result'] = 'Fail: Not Audited'
+            cleaned_df['NAP_Audit_Result'] = 'Fail: Not Audited'
             
             # Loop through rows
             for index, row in cleaned_df.iterrows():
