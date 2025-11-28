@@ -4,5 +4,10 @@
 !agent.py
 !serp_config.py
 !README.md
+
+# Allow modules
+!modules/
+!modules/*.py
+
 # Allow traversing into directories so the exceptions can take effect
 !*/
