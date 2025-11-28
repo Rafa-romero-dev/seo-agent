@@ -81,7 +81,7 @@ python Agent.py 2 5
 
 ## Output Files
 
-*   **`MapWinners_Campaign_YYYYMMDD.csv`**:
+*   **`Leads_Campaign_YYYYMMDD.csv`**:
     *   Contains only Actionable Leads with Emails.
     *   Columns: `Prospect_Name`, `Email_Address`, `Subject_1`, `Body_1`, `Subject_2`, `Body_2`, `Subject_3`, `Body_3`.
     *   *Ready for import into Instantly.ai / Lemlist.*

@@ -327,7 +327,7 @@ def generate_ai_campaign(row):
     
     # 2. Define the Prompt
     prompt = f"""
-    You are a top-tier SEO Sales Copywriter for an agency called "MapWinners". 
+    You are a top-tier SEO Sales Copywriter for a top-tier SEO agency. 
     Your goal is to write a 3-email cold outreach sequence for a local business.
     
     PROSPECT DETAILS:
@@ -827,7 +827,7 @@ def create_final_report(df):
     df_instantly = df[(df['Actionable_Target'] == 'YES') & (df['Subject_1'].notna()) & (df['Subject_1'] != '')][instantly_columns].copy()
     
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    csv_filename = f"MapWinners_Campaign_{timestamp}.csv"
+    csv_filename = f"Leads_Campaign_{timestamp}.csv"
     
     df_instantly.to_csv(csv_filename, index=False)
     print(f"File: {csv_filename} (Ready for Instantly.ai)")
